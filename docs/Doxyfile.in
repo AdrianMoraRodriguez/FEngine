@@ -1,0 +1,68 @@
+PROJECT_NAME           = "@PROJECT_NAME@"
+PROJECT_NUMBER         = "@PROJECT_VERSION@"
+PROJECT_BRIEF          = "@PROJECT_DESCRIPTION@"
+
+OUTPUT_DIRECTORY       = @DOXYGEN_OUTPUT_DIR@
+INPUT                  = @DOXYGEN_INPUT_DIR@
+RECURSIVE              = YES
+FILE_PATTERNS          = *.h *.hpp *.cpp *.md
+USE_MDFILE_AS_MAINPAGE = @DOXYGEN_MAINPAGE@
+
+# Qué documentar
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+
+# Avisar de lo que falta por documentar
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+
+# Estilo de comentarios
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+
+# C++
+BUILTIN_STL_SUPPORT    = YES
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+# Salida
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+HTML_COLORSTYLE        = LIGHT
+
+# Doxygen Awesome
+HTML_EXTRA_STYLESHEET  = "@DOXYGEN_AWESOME_DIR@/doxygen-awesome.css" \
+                         "@DOXYGEN_AWESOME_DIR@/doxygen-awesome-sidebar-only.css" \
+                         "@DOXYGEN_AWESOME_DIR@/doxygen-awesome-sidebar-only-darkmode-toggle.css"
+HTML_EXTRA_FILES       = "@DOXYGEN_AWESOME_DIR@/doxygen-awesome-darkmode-toggle.js" \
+                         "@DOXYGEN_AWESOME_DIR@/doxygen-awesome-fragment-copy-button.js" \
+                         "@DOXYGEN_AWESOME_DIR@/doxygen-awesome-paragraph-link.js"
+HTML_HEADER            = @DOXYGEN_HEADER@
+HTML_COPY_CLIPBOARD    = NO
+
+# Diagramas
+HAVE_DOT               = YES
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = NO
+INCLUDE_GRAPH          = NO
+INCLUDED_BY_GRAPH      = NO
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+DOT_TRANSPARENT        = YES
+
+QUIET                  = NO
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = NO

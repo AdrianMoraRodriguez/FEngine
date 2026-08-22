@@ -78,3 +78,8 @@ Desktop.ini
 *.rdc
 *.nvdb
 captures/
+
+# Documentación generada
+docs/html/
+docs/xml/
+docs/latex/
