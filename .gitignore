@@ -1,0 +1,80 @@
+# Directorios de compilación
+build/
+out/
+bin/
+lib/
+[Dd]ebug/
+[Rr]elease/
+[Rr]elWithDebInfo/
+[Mm]inSizeRel/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+_deps/
+*.cmake.stamp
+
+# vcpkg (modo manifest: las dependencias se reconstruyen, no se versionan)
+vcpkg_installed/
+.vcpkg-root
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+ipch/
+*.aps
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# Binarios y objetos
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+*.exp
+
+# Shaders compilados (se generan desde el fuente GLSL)
+*.spv
+
+# Configuración local del editor, no del proyecto
+feditor_layout.ini
+imgui.ini
+
+# Sistema operativo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Perfilado y capturas
+*.rdc
+*.nvdb
+captures/

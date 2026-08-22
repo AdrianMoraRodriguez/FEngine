@@ -1,0 +1,34 @@
+# Normalización automática de finales de línea
+* text=auto
+
+# Fuentes: siempre LF en el repositorio
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.hpp   text eol=lf
+*.glsl  text eol=lf
+*.vert  text eol=lf
+*.frag  text eol=lf
+*.comp  text eol=lf
+*.txt   text eol=lf
+*.cmake text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
+# Scripts de Windows: CRLF obligatorio o no se ejecutan bien
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+
+# Binarios: nunca tocar
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.tga   binary
+*.hdr   binary
+*.ktx   binary
+*.dds   binary
+*.gltf  text eol=lf
+*.glb   binary
+*.bin   binary
+*.ttf   binary
+*.otf   binary
+*.spv   binary
