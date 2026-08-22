@@ -1,18 +1,22 @@
 #include "platform/Window.h"
+
 #include "core/Log.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
 namespace fe {
-
-  //Esto es equivalente a un static a nivel de archivo
   namespace {
 
-    void glfwErrorCallback(int error, const char* description) {
-      FE_ERROR("GLFW Error (%d): %s", error, description);
+    /// Reports GLFW errors through the engine log.
+    void glfwErrorCallback(int code, const char* description) {
+      FE_ERROR("GLFW (%d): %s", code, description);
     }
-
+  
+    /// Forwards framebuffer resizes to the owning Window instance.
+    ///
+    /// GLFW callbacks are free functions with no `this` pointer, so the instance
+    /// is recovered from the user pointer stored during initialisation.
     void framebufferSizeCallback(GLFWwindow* handle, int width, int height) {
       auto* self = static_cast<Window*>(glfwGetWindowUserPointer(handle));
       if (self) {
@@ -29,15 +33,19 @@ namespace fe {
     glfwSetErrorCallback(glfwErrorCallback);
 
     if (!glfwInit()) {
-      FE_ERROR("glfwInit has failed");
+      FE_ERROR("Failed to initialise GLFW");
       return false;
     }
 
+    // Tell GLFW not to create an OpenGL context: Vulkan creates its drawing
+    // surface separately.
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
-    m_handle = glfwCreateWindow(spec.width, spec.height, spec.title.c_str(), nullptr, nullptr);
+    m_handle = glfwCreateWindow(spec.width, spec.height, spec.title.c_str(),
+                                nullptr, nullptr);
     if (!m_handle) {
-      FE_ERROR("glfwCreateWindow has failed");
+      FE_ERROR("Failed to create window");
+      glfwTerminate();
       return false;
     }
 
@@ -45,7 +53,7 @@ namespace fe {
     glfwSetFramebufferSizeCallback(m_handle, framebufferSizeCallback);
     glfwGetFramebufferSize(m_handle, &m_width, &m_height);
 
-    FE_INFO("Window created: %dx%d", m_width, m_height);
+    FE_INFO("Window created: %d x %d", m_width, m_height);
     return true;
   }
 
@@ -58,13 +66,13 @@ namespace fe {
   }
 
   void Window::onFramebufferResized(int width, int height) {
-    m_width = width;
-    m_height = height;
+    m_width   = width;
+    m_height  = height;
     m_resized = true;
   }
 
   bool Window::consumeResizeFlag() {
-    bool wasResized = m_resized;
+    const bool wasResized = m_resized;
     m_resized = false;
     return wasResized;
   }
@@ -80,4 +88,5 @@ namespace fe {
   const char** Window::requiredInstanceExtensions(unsigned int* outCount) {
     return glfwGetRequiredInstanceExtensions(outCount);
   }
+
 }
