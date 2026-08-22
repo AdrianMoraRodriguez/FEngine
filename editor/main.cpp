@@ -1,13 +1,32 @@
+#include "core/Log.h"
 #include "core/Version.h"
-
-#include <cstdio>
+#include "platform/Window.h"
 
 int main() {
-  const fe::Version v = fe::engineVersion();
+    FE_INFO("%s", fe::engineVersionString());
 
-  std::printf("%s\n", fe::engineVersionString());
-  std::printf("major=%d minor=%d patch=%d\n", v.major, v.minor, v.patch);
-  std::printf("Prueba de build operativo.\n");
+    fe::Window window;
+    if (!window.init(fe::WindowSpec{})) {
+        return 1;
+    }
 
-  return 0;
+    unsigned int extensionCount = 0;
+    const char** extensions =
+        fe::Window::requiredInstanceExtensions(&extensionCount);
+
+    FE_INFO("GLFW requiere %u extensiones de instancia de Vulkan:", extensionCount);
+    for (unsigned int i = 0; i < extensionCount; ++i) {
+        FE_INFO("  - %s", extensions[i]);
+    }
+
+    while (!window.shouldClose()) {
+        window.pollEvents();
+
+        if (window.consumeResizeFlag()) {
+            FE_TRACE("Framebuffer: %d x %d", window.width(), window.height());
+        }
+    }
+
+    FE_INFO("Cerrando");
+    return 0;
 }
