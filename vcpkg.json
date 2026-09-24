@@ -4,7 +4,11 @@
   "version": "0.1.0",
   "description": "A 3D game engine with a scene editor",
   "dependencies": [
-    "glfw3"
+    "glfw3",
+    "glm",
+    "vulkan",
+    "vk-bootstrap",
+    "vulkan-memory-allocator"
   ],
   "builtin-baseline": "127402f1c75bb3d5ff6bce04b285faa4930a5aca"
 }
