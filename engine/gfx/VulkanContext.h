@@ -42,7 +42,7 @@ namespace fe {
      * @return `true` on success. On failure the reason is logged and the
      *         object is safe to destroy.
      */
-    bool init(const Window& window, const VulkanContextSpec& spec);
+    bool init(const Window& window, const VulkanContextSpec& spec = {});
 
     /**
      * @brief Destroys all Vulkan objects in reverse creation order.
