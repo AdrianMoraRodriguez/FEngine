@@ -9,6 +9,8 @@
     "vulkan",
     "vk-bootstrap",
     "vulkan-memory-allocator",
+    "entt",
+    "nlohmann-json",
     {
       "name": "imgui",
       "features": [

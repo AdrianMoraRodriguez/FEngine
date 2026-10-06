@@ -11,13 +11,20 @@ find_package(glm CONFIG REQUIRED)
 find_package(Vulkan REQUIRED)
 find_package(vk-bootstrap CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+find_package(EnTT CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 target_link_libraries(FEngine PUBLIC
                         glfw
                         glm::glm
                         Vulkan::Vulkan
                         vk-bootstrap::vk-bootstrap
-                        GPUOpen::VulkanMemoryAllocator)
+                        GPUOpen::VulkanMemoryAllocator
+                        EnTT::EnTT
+                        nlohmann_json::nlohmann_json)
+                        
+target_link_libraries(FEngine PRIVATE imgui::imgui)
 
 target_compile_definitions(FEngine PUBLIC
                             GLM_FORCE_DEPTH_ZERO_TO_ONE
