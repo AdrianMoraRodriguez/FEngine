@@ -1,0 +1,93 @@
+{
+  "entities": [
+    {
+      "components": {
+        "Name": {
+          "name": "Root"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 15585024300046805833
+    },
+    {
+      "components": {
+        "Name": {
+          "name": "Child"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 15585024300046805833,
+      "uuid": 13947439495640046696
+    },
+    {
+      "components": {
+        "Camera": {
+          "farPlane": 1000.0,
+          "fovDegrees": 60.0,
+          "nearPlane": 0.10000000149011612,
+          "primary": true
+        },
+        "Name": {
+          "name": "Camera"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            5.0,
+            10.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 15585024300046805833,
+      "uuid": 2720999789741745363
+    }
+  ],
+  "name": "Test Scene",
+  "version": 1
+}

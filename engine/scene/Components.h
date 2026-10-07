@@ -24,6 +24,19 @@
 #include <string>
 #include <cstdint>
 
+
+// GLM serialisation overloads must live in the glm namespace so that
+// nlohmann's ADL lookup finds them when serialising glm types embedded
+// in component structs.
+namespace glm {
+    void to_json(nlohmann::json& j, const vec3& v);
+    void from_json(const nlohmann::json& j, vec3& v);
+    void to_json(nlohmann::json& j, const vec4& v);
+    void from_json(const nlohmann::json& j, vec4& v);
+    void to_json(nlohmann::json& j, const quat& q);
+    void from_json(const nlohmann::json& j, quat& q);
+} // namespace glm
+
 namespace fe {
 
 using json         = nlohmann::json;
@@ -168,13 +181,6 @@ struct LightComponent {
 // overloads in the fe namespace so that ADL finds them when serialising
 // any component that contains GLM members.
 // ---------------------------------------------------------------------------
-
-void to_json(json& j, const glm::vec3& v);
-void from_json(const json& j, glm::vec3& v);
-void to_json(json& j, const glm::vec4& v);
-void from_json(const json& j, glm::vec4& v);
-void to_json(json& j, const glm::quat& q);
-void from_json(const json& j, glm::quat& q);
 
 // Component serialisation — generates to_json/from_json for each struct.
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NameComponent, name)

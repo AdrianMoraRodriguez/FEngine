@@ -9,6 +9,8 @@
 #include "gfx/VulkanContext.h"
 #include "gfx/Renderer.h"
 #include "scene/Scene.h"
+#include "scene/ComponentRegistry.h"
+#include "scene/SceneSerializer.h"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -32,14 +34,16 @@ bool initImGui(const fe::VulkanContext& ctx,
                const fe::Renderer& renderer) {
 
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 },
+      { VK_DESCRIPTOR_TYPE_SAMPLER,                1  },
+      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 },
+      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          1  },
     };
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     poolInfo.maxSets       = 16;
-    poolInfo.poolSizeCount = 1;
+    poolInfo.poolSizeCount = 3;
     poolInfo.pPoolSizes    = poolSizes;
 
     if (vkCreateDescriptorPool(ctx.device(), &poolInfo, nullptr, &g_imguiPool)
@@ -190,101 +194,85 @@ void drawHierarchyNode(fe::Scene& scene, entt::entity e) {
 // ---------------------------------------------------------------------------
 
 int main() {
-    FE_INFO("%s", fe::engineVersionString());
-
-    fe::Window window;
-    if (!window.init(fe::WindowSpec{})) return 1;
-
-    fe::VulkanContext vkCtx;
-    if (!vkCtx.init(window)) return 1;
-
-    fe::Renderer renderer;
-    if (!renderer.init(vkCtx, window)) return 1;
-
-    if (!initImGui(vkCtx, window, renderer)) return 1;
-
-    // Build a test scene to verify the ECS compiles and runs correctly.
-    fe::Scene scene;
-    scene.setName("Test Scene");
-    {
-        entt::entity root   = scene.create("Root");
-        entt::entity child  = scene.create("Child", root);
-        entt::entity camera = scene.create("Camera", root);
-        (void)child;
-        scene.registry().emplace<fe::CameraComponent>(camera);
-        scene.updateTransforms();
-        FE_INFO("Scene '%s' ready (%zu entities)",
-                scene.name().c_str(),
-                scene.registry().storage<entt::entity>().size());
-    }
-
-    bool     running    = true;
-    uint64_t frameCount = 0;
-    double   lastTime   = 0.0;
-    double   deltaTime  = 0.0;
-
-    while (running && !window.shouldClose()) {
-        const double now = glfwGetTime();
-        deltaTime = now - lastTime;
-        lastTime  = now;
-        ++frameCount;
-
-        window.pollEvents();
-
-        ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-
-        beginDockspace(running);
-
-        // ---- Hierarchy panel ----
-        ImGui::Begin("Hierarchy");
-        ImGui::Text("Scene: %s", scene.name().c_str());
-        ImGui::Separator();
-        for (entt::entity e = scene.firstRoot(); e != entt::null;
-             e = scene.registry().get<fe::Relationship>(e).nextSibling)
-            drawHierarchyNode(scene, e);
-        ImGui::End();
-
-        // ---- Inspector panel ----
-        ImGui::Begin("Inspector");
-        ImGui::TextUnformatted("(select an entity)");
-        ImGui::End();
-
-        // ---- Viewport panel ----
-        ImGui::Begin("Viewport");
-        ImGui::TextUnformatted("Scene will be rendered here.");
-        ImGui::End();
-
-        // ---- Statistics panel ----
-        ImGui::Begin("Statistics");
-        ImGui::Text("Frame time : %.3f ms", deltaTime * 1000.0);
-        ImGui::Text("FPS        : %.1f",    deltaTime > 0.0 ? 1.0 / deltaTime : 0.0);
-        ImGui::Text("Frame #    : %llu",    frameCount);
-        ImGui::Text("Entities   : %zu",     scene.registry().storage<entt::entity>().size());
-        ImGui::Text("Viewport   : %u x %u",
-                    renderer.swapchainExtent().width,
-                    renderer.swapchainExtent().height);
-        ImGui::End();
-
-        ImGui::Render();
-
-        if (!renderer.beginFrame()) continue;
-
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
-                                        renderer.currentCommandBuffer());
-
-        renderer.endFrame();
-    }
-
-    FE_INFO("Shutting down");
-
-    vkDeviceWaitIdle(vkCtx.device());
-
-    shutdownImGui(vkCtx.device());
-    renderer.shutdown();
-    vkCtx.shutdown();
-    window.shutdown();
-
-    return 0;
+  FE_INFO("%s", fe::engineVersionString());
+  fe::Window window;
+  if (!window.init(fe::WindowSpec{})) return 1;
+  fe::VulkanContext vkCtx;
+  if (!vkCtx.init(window)) return 1;
+  fe::Renderer renderer;
+  if (!renderer.init(vkCtx, window)) return 1;
+  if (!initImGui(vkCtx, window, renderer)) return 1;
+  fe::registerBuiltinComponents();
+  // Build a test scene to verify the ECS compiles and runs correctly.
+  fe::Scene scene;
+  scene.setName("Test Scene");
+  {
+    entt::entity root   = scene.create("Root");
+    entt::entity child  = scene.create("Child", root);
+    entt::entity camera = scene.create("Camera", root);
+    (void)child;
+    scene.registry().emplace<fe::CameraComponent>(camera);
+    scene.transform(camera).position = {0.0f, 5.0f, 10.0f};
+    scene.updateTransforms();
+    // Test round-trip: save then reload into a fresh scene.
+    fe::SceneSerializer::saveToFile(scene, "test_scene.fescene");
+    fe::Scene loaded;
+    fe::SceneSerializer::loadFromFile(loaded, "test_scene.fescene");
+    FE_INFO("Round-trip OK: loaded scene has '%s' with %zu entities",
+            loaded.name().c_str(),
+            loaded.registry().storage<entt::entity>().size());
+  }
+  bool     running    = true;
+  uint64_t frameCount = 0;
+  double   lastTime   = 0.0;
+  double   deltaTime  = 0.0;
+  while (running && !window.shouldClose()) {
+    const double now = glfwGetTime();
+    deltaTime = now - lastTime;
+    lastTime  = now;
+    ++frameCount;
+    window.pollEvents();
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+    beginDockspace(running);
+    // ---- Hierarchy panel ----
+    ImGui::Begin("Hierarchy");
+    ImGui::Text("Scene: %s", scene.name().c_str());
+    ImGui::Separator();
+    for (entt::entity e = scene.firstRoot(); e != entt::null;
+         e = scene.registry().get<fe::Relationship>(e).nextSibling)
+        drawHierarchyNode(scene, e);
+    ImGui::End();
+    // ---- Inspector panel ----
+    ImGui::Begin("Inspector");
+    ImGui::TextUnformatted("(select an entity)");
+    ImGui::End();
+    // ---- Viewport panel ----
+    ImGui::Begin("Viewport");
+    ImGui::TextUnformatted("Scene will be rendered here.");
+    ImGui::End();
+    // ---- Statistics panel ----
+    ImGui::Begin("Statistics");
+    ImGui::Text("Frame time : %.3f ms", deltaTime * 1000.0);
+    ImGui::Text("FPS        : %.1f",    deltaTime > 0.0 ? 1.0 / deltaTime : 0.0);
+    ImGui::Text("Frame #    : %llu",    frameCount);
+    ImGui::Text("Entities   : %zu",     scene.registry().storage<entt::entity>().size());
+    ImGui::Text("Viewport   : %u x %u",
+                renderer.swapchainExtent().width,
+                renderer.swapchainExtent().height);
+    ImGui::End();
+    ImGui::Render();
+    if (!renderer.beginFrame()) continue;
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
+                                    renderer.currentCommandBuffer());
+    renderer.endFrame();
+  }
+  FE_INFO("Shutting down");
+  vkDeviceWaitIdle(vkCtx.device());
+  shutdownImGui(vkCtx.device());
+  renderer.shutdown();
+  vkCtx.shutdown();
+  window.shutdown();
+  return 0;
 }
