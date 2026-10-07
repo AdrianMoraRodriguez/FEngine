@@ -113,6 +113,43 @@ public:
      */
     VkCommandBuffer currentCommandBuffer() const;
 
+    /**
+     * @brief Begins a rendering pass into an offscreen image.
+     *
+     * Records the layout transition and vkCmdBeginRendering targeting
+     * @p colorTarget. The caller records draw commands after this call.
+     *
+     * @param cmd         Command buffer to record into (from currentCommandBuffer()).
+     * @param colorTarget The image to render into.
+     * @param colorView   Image view of @p colorTarget.
+     * @param extent      Dimensions of the render area.
+     */
+    static void beginOffscreenPass(VkCommandBuffer cmd,
+                                   VkImage colorTarget,
+                                   VkImageView colorView,
+                                   VkExtent2D extent);
+
+    /**
+     * @brief Ends the offscreen rendering pass and transitions the image
+     *        to SHADER_READ_ONLY_OPTIMAL so ImGui can sample it.
+     *
+     * @param cmd         Command buffer (same one passed to beginOffscreenPass).
+     * @param colorTarget The image that was rendered into.
+     */
+    static void endOffscreenPass(VkCommandBuffer cmd, VkImage colorTarget);
+
+    /**
+     * @brief Opens the render pass targeting the current swapchain image.
+     *
+     * Must be called after all offscreen passes are done and before any
+     * commands that draw into the swapchain (e.g. ImGui).
+     * Clears the swapchain image to the editor background colour.
+     */
+    void beginSwapchainPass();
+        
+    /// @brief Closes the swapchain render pass opened by beginSwapchainPass().
+    void endSwapchainPass();
+
     /// @return Current swapchain image extent in pixels.
     VkExtent2D swapchainExtent() const { return m_swapchainExtent; }
 

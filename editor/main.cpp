@@ -11,6 +11,7 @@
 #include "scene/Scene.h"
 #include "scene/ComponentRegistry.h"
 #include "scene/SceneSerializer.h"
+#include "gfx/OffscreenBuffer.h"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -202,6 +203,8 @@ int main() {
   fe::Renderer renderer;
   if (!renderer.init(vkCtx, window)) return 1;
   if (!initImGui(vkCtx, window, renderer)) return 1;
+  fe::OffscreenBuffer offscreen;
+  if (!offscreen.init(vkCtx, 1280, 720)) return 1;
   fe::registerBuiltinComponents();
   // Build a test scene to verify the ECS compiles and runs correctly.
   fe::Scene scene;
@@ -249,9 +252,24 @@ int main() {
     ImGui::TextUnformatted("(select an entity)");
     ImGui::End();
     // ---- Viewport panel ----
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("Viewport");
-    ImGui::TextUnformatted("Scene will be rendered here.");
+
+    ImVec2 panelSize = ImGui::GetContentRegionAvail();
+    uint32_t vpW = static_cast<uint32_t>(panelSize.x);
+    uint32_t vpH = static_cast<uint32_t>(panelSize.y);
+
+    // Resize offscreen buffer when the panel changes size.
+    if (vpW > 0 && vpH > 0)
+        offscreen.resize(vpW, vpH);
+
+    // Display the offscreen image. Cast the descriptor set to ImTextureID.
+    ImGui::Image(
+        reinterpret_cast<ImTextureID>(offscreen.imguiDescriptorSet()),
+        panelSize);
+
     ImGui::End();
+    ImGui::PopStyleVar();
     // ---- Statistics panel ----
     ImGui::Begin("Statistics");
     ImGui::Text("Frame time : %.3f ms", deltaTime * 1000.0);
@@ -264,13 +282,32 @@ int main() {
     ImGui::End();
     ImGui::Render();
     if (!renderer.beginFrame()) continue;
+
+    // 1. Offscreen pass — render the scene.
+    fe::Renderer::beginOffscreenPass(
+        renderer.currentCommandBuffer(),
+        offscreen.image(),
+        offscreen.imageView(),
+        {offscreen.width(), offscreen.height()});
+    
+    // (geometry draw calls will go here)
+    
+    fe::Renderer::endOffscreenPass(
+        renderer.currentCommandBuffer(),
+        offscreen.image());
+    
+    // 2. Swapchain pass — render ImGui on top.
+    renderer.beginSwapchainPass();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
                                     renderer.currentCommandBuffer());
+    renderer.endSwapchainPass();
+    
     renderer.endFrame();
   }
   FE_INFO("Shutting down");
   vkDeviceWaitIdle(vkCtx.device());
   shutdownImGui(vkCtx.device());
+  offscreen.shutdown();
   renderer.shutdown();
   vkCtx.shutdown();
   window.shutdown();

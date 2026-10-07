@@ -7,6 +7,7 @@
 
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <vk_mem_alloc.h>
 
 namespace fe {
   class Window;
@@ -63,6 +64,9 @@ namespace fe {
     /// @return The window presentation surface.
     VkSurfaceKHR surface() const { return m_surface; }
 
+    /// @return The Vulkan Memory Allocator instance.
+    VmaAllocator allocator() const { return m_allocator; }
+
     /**
      * @brief The queue used to submit graphics and compute work.
      *
@@ -87,6 +91,7 @@ namespace fe {
     VkQueue m_presentQueue = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
     VkSurfaceKHR m_surface = VK_NULL_HANDLE;
+    VmaAllocator m_allocator = VK_NULL_HANDLE;
 
     uint32_t m_graphicsQueueFamily = 0;
     uint32_t m_presentQueueFamily = 0;

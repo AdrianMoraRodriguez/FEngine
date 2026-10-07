@@ -16,6 +16,10 @@ namespace fe {
   }
 
   void VulkanContext::shutdown() {
+    if (m_allocator != VK_NULL_HANDLE) {
+    vmaDestroyAllocator(m_allocator);
+    m_allocator = VK_NULL_HANDLE;
+    }
     if (m_device != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(m_device);
       vkDestroyDevice(m_device, nullptr);
@@ -201,6 +205,20 @@ namespace fe {
 
     FE_INFO("Queues ready (graphics family: %u, present family: %u)",
             m_graphicsQueueFamily, m_presentQueueFamily);
+
+    VmaAllocatorCreateInfo allocatorInfo{};
+    allocatorInfo.instance         = m_instance;
+    allocatorInfo.physicalDevice   = m_physicalDevice;
+    allocatorInfo.device           = m_device;
+    allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_3;
+    allocatorInfo.flags            = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+
+    if (vmaCreateAllocator(&allocatorInfo, &m_allocator) != VK_SUCCESS) {
+        FE_ERROR("Failed to create VMA allocator");
+        return false;
+    }
+
+    FE_INFO("VMA allocator created");
 
     return true;
   }

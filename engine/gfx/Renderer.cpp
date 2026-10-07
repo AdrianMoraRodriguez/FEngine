@@ -7,7 +7,6 @@
 #include <VkBootstrap.h>
 
 namespace fe {
-namespace {
 
 // ---------------------------------------------------------------------------
 // Image layout transition helper
@@ -47,8 +46,6 @@ void transitionImage(VkCommandBuffer cmd, VkImage image,
 
     vkCmdPipelineBarrier2(cmd, &dep);
 }
-
-} // namespace
 
 // ---------------------------------------------------------------------------
 // Destruction
@@ -231,55 +228,9 @@ void Renderer::recreateSwapchain() {
 // Frame loop
 // ---------------------------------------------------------------------------
 
-bool Renderer::beginFrame() {
-    if (m_window->isMinimized()) return false;
+void Renderer::beginSwapchainPass() {
+    auto& frame = m_frames[m_currentFrame];
 
-    auto& frame  = m_frames[m_currentFrame];
-    VkDevice dev = m_ctx->device();
-
-    // Block until the GPU has finished with this frame slot.
-    vkWaitForFences(dev, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX);
-
-    // Acquire the next swapchain image.
-    // The semaphore indexed by m_currentFrame is guaranteed to be idle:
-    // we waited on inFlightFence above, which means the previous submission
-    // using this slot has completed and the presentation engine has had
-    // enough time to consume the semaphore.
-    VkResult acquireResult = vkAcquireNextImageKHR(
-        dev, m_swapchain, UINT64_MAX,
-        m_imageAvailableSemaphores[m_currentFrame],
-        VK_NULL_HANDLE,
-        &m_imageIndex);
-
-    if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
-        recreateSwapchain();
-        return false;
-    }
-    if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
-        FE_ERROR("Failed to acquire swapchain image");
-        return false;
-    }
-
-    // Reset the fence only after confirming we will submit work for this slot.
-    // Resetting before a potential early return would leave it unsignalled,
-    // causing the next vkWaitForFences on this slot to block forever.
-    vkResetFences(dev, 1, &frame.inFlightFence);
-
-    vkResetCommandBuffer(frame.commandBuffer, 0);
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(frame.commandBuffer, &beginInfo);
-
-    // Transition the swapchain image to a layout suitable for rendering.
-    // UNDEFINED as old layout discards previous contents, saving a resolve.
-    transitionImage(frame.commandBuffer,
-                    m_swapchainImages[m_imageIndex],
-                    VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-    // Begin dynamic rendering with a clear to the engine background colour.
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     colorAttachment.imageView   = m_swapchainImageViews[m_imageIndex];
@@ -297,16 +248,57 @@ bool Renderer::beginFrame() {
     renderingInfo.pColorAttachments    = &colorAttachment;
 
     vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+}
+
+void Renderer::endSwapchainPass() {
+    vkCmdEndRendering(m_frames[m_currentFrame].commandBuffer);
+}
+
+bool Renderer::beginFrame() {
+    if (m_window->isMinimized()) return false;
+
+    auto& frame  = m_frames[m_currentFrame];
+    VkDevice dev = m_ctx->device();
+
+    vkWaitForFences(dev, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX);
+
+    VkResult acquireResult = vkAcquireNextImageKHR(
+        dev, m_swapchain, UINT64_MAX,
+        m_imageAvailableSemaphores[m_currentFrame],
+        VK_NULL_HANDLE,
+        &m_imageIndex);
+
+    if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapchain();
+        return false;
+    }
+    if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
+        FE_ERROR("Failed to acquire swapchain image");
+        return false;
+    }
+
+    vkResetFences(dev, 1, &frame.inFlightFence);
+    vkResetCommandBuffer(frame.commandBuffer, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(frame.commandBuffer, &beginInfo);
+
+    // Transition the swapchain image so it is ready to receive colour output.
+    // No render pass is opened here — callers do that explicitly.
+    transitionImage(frame.commandBuffer,
+                    m_swapchainImages[m_imageIndex],
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
     return true;
 }
 
 void Renderer::endFrame() {
     auto& frame = m_frames[m_currentFrame];
 
-    vkCmdEndRendering(frame.commandBuffer);
-
-    // Transition the image to PRESENT_SRC_KHR so the presentation engine
-    // can display it.
+    // Transition the swapchain image for presentation.
     transitionImage(frame.commandBuffer,
                     m_swapchainImages[m_imageIndex],
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -314,9 +306,6 @@ void Renderer::endFrame() {
 
     vkEndCommandBuffer(frame.commandBuffer);
 
-    // Submit the command buffer.
-    // Wait on imageAvailable before writing colour output.
-    // Signal renderFinished when the GPU is done.
     VkCommandBufferSubmitInfo cmdInfo{};
     cmdInfo.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
     cmdInfo.commandBuffer = frame.commandBuffer;
@@ -342,7 +331,6 @@ void Renderer::endFrame() {
 
     vkQueueSubmit2(m_ctx->graphicsQueue(), 1, &submitInfo, frame.inFlightFence);
 
-    // Present the rendered image.
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     presentInfo.waitSemaphoreCount = 1;
@@ -364,6 +352,46 @@ void Renderer::endFrame() {
 
 VkCommandBuffer Renderer::currentCommandBuffer() const {
     return m_frames[m_currentFrame].commandBuffer;
+}
+
+void Renderer::beginOffscreenPass(VkCommandBuffer cmd,
+                                  VkImage colorTarget,
+                                  VkImageView colorView,
+                                  VkExtent2D extent) {
+    // Transition from whatever layout the image is in (UNDEFINED on first
+    // use, SHADER_READ_ONLY after previous frames) to COLOR_ATTACHMENT.
+    transitionImage(cmd, colorTarget,
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView   = colorView;
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    // Scene background colour — slightly different from the editor background
+    // so the panel boundary is visible even before geometry is drawn.
+    colorAttachment.clearValue.color = {{0.18f, 0.18f, 0.22f, 1.0f}};
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea.offset    = {0, 0};
+    renderingInfo.renderArea.extent    = extent;
+    renderingInfo.layerCount           = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments    = &colorAttachment;
+
+    vkCmdBeginRendering(cmd, &renderingInfo);
+}
+
+void Renderer::endOffscreenPass(VkCommandBuffer cmd, VkImage colorTarget) {
+    vkCmdEndRendering(cmd);
+
+    // Transition to SHADER_READ_ONLY_OPTIMAL so the ImGui sampler can read it.
+    transitionImage(cmd, colorTarget,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 } // namespace fe
