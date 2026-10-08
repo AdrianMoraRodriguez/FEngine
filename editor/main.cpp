@@ -8,19 +8,26 @@
 #include "platform/Window.h"
 #include "gfx/VulkanContext.h"
 #include "gfx/Renderer.h"
+#include "gfx/OffscreenBuffer.h"
 #include "scene/Scene.h"
 #include "scene/ComponentRegistry.h"
 #include "scene/SceneSerializer.h"
-#include "gfx/OffscreenBuffer.h"
+#include "editor/AssetBrowser.h"
+#include "editor/HierarchyPanel.h"
+#include "editor/InspectorPanel.h"
+#include "editor/ViewportPanel.h"
+#include "editor/StatisticsPanel.h"
+#include "gfx/MeshPipeline.h"
+#include "gfx/MeshBuffer.h"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
+#include <glm/gtc/matrix_transform.hpp>
+#include <windows.h>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
-
-#include <functional>
 
 namespace {
 
@@ -35,9 +42,9 @@ bool initImGui(const fe::VulkanContext& ctx,
                const fe::Renderer& renderer) {
 
     VkDescriptorPoolSize poolSizes[] = {
-      { VK_DESCRIPTOR_TYPE_SAMPLER,                1  },
-      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 },
-      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          1  },
+        { VK_DESCRIPTOR_TYPE_SAMPLER,                1  },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          1  },
     };
 
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -79,15 +86,15 @@ bool initImGui(const fe::VulkanContext& ctx,
     pipelineRenderingInfo.pColorAttachmentFormats = &fmt;
 
     ImGui_ImplVulkan_InitInfo initInfo{};
-    initInfo.ApiVersion         = VK_API_VERSION_1_3;
-    initInfo.Instance           = ctx.instance();
-    initInfo.PhysicalDevice     = ctx.physicalDevice();
-    initInfo.Device             = ctx.device();
-    initInfo.QueueFamily        = ctx.graphicsQueueFamily();
-    initInfo.Queue              = ctx.graphicsQueue();
-    initInfo.DescriptorPool     = g_imguiPool;
-    initInfo.MinImageCount      = 2;
-    initInfo.ImageCount         = 2;
+    initInfo.ApiVersion          = VK_API_VERSION_1_3;
+    initInfo.Instance            = ctx.instance();
+    initInfo.PhysicalDevice      = ctx.physicalDevice();
+    initInfo.Device              = ctx.device();
+    initInfo.QueueFamily         = ctx.graphicsQueueFamily();
+    initInfo.Queue               = ctx.graphicsQueue();
+    initInfo.DescriptorPool      = g_imguiPool;
+    initInfo.MinImageCount       = 2;
+    initInfo.ImageCount          = 2;
     initInfo.UseDynamicRendering = true;
 
     initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
@@ -150,42 +157,17 @@ void beginDockspace(bool& running) {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem("Hierarchy",  nullptr, nullptr);
-            ImGui::MenuItem("Inspector",  nullptr, nullptr);
-            ImGui::MenuItem("Viewport",   nullptr, nullptr);
-            ImGui::MenuItem("Statistics", nullptr, nullptr);
+            ImGui::MenuItem("Hierarchy",     nullptr, nullptr);
+            ImGui::MenuItem("Inspector",     nullptr, nullptr);
+            ImGui::MenuItem("Viewport",      nullptr, nullptr);
+            ImGui::MenuItem("Statistics",    nullptr, nullptr);
+            ImGui::MenuItem("Asset Browser", nullptr, nullptr);
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
     }
 
     ImGui::End();
-}
-
-// ---------------------------------------------------------------------------
-// Hierarchy panel
-// ---------------------------------------------------------------------------
-
-void drawHierarchyNode(fe::Scene& scene, entt::entity e) {
-    const auto& name = scene.registry().get<fe::NameComponent>(e).name;
-    const auto& rel  = scene.registry().get<fe::Relationship>(e);
-
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow
-                             | ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (rel.firstChild == entt::null)
-        flags |= ImGuiTreeNodeFlags_Leaf;
-
-    bool open = ImGui::TreeNodeEx(
-        reinterpret_cast<void*>(static_cast<intptr_t>(
-            static_cast<std::uint32_t>(e))),
-        flags, "%s", name.c_str());
-
-    if (open) {
-        for (entt::entity c = rel.firstChild; c != entt::null;
-             c = scene.registry().get<fe::Relationship>(c).nextSibling)
-            drawHierarchyNode(scene, c);
-        ImGui::TreePop();
-    }
 }
 
 } // namespace
@@ -195,121 +177,191 @@ void drawHierarchyNode(fe::Scene& scene, entt::entity e) {
 // ---------------------------------------------------------------------------
 
 int main() {
-  FE_INFO("%s", fe::engineVersionString());
-  fe::Window window;
-  if (!window.init(fe::WindowSpec{})) return 1;
-  fe::VulkanContext vkCtx;
-  if (!vkCtx.init(window)) return 1;
-  fe::Renderer renderer;
-  if (!renderer.init(vkCtx, window)) return 1;
-  if (!initImGui(vkCtx, window, renderer)) return 1;
-  fe::OffscreenBuffer offscreen;
-  if (!offscreen.init(vkCtx, 1280, 720)) return 1;
-  fe::registerBuiltinComponents();
-  // Build a test scene to verify the ECS compiles and runs correctly.
-  fe::Scene scene;
-  scene.setName("Test Scene");
-  {
-    entt::entity root   = scene.create("Root");
-    entt::entity child  = scene.create("Child", root);
-    entt::entity camera = scene.create("Camera", root);
-    (void)child;
-    scene.registry().emplace<fe::CameraComponent>(camera);
-    scene.transform(camera).position = {0.0f, 5.0f, 10.0f};
-    scene.updateTransforms();
-    // Test round-trip: save then reload into a fresh scene.
-    fe::SceneSerializer::saveToFile(scene, "test_scene.fescene");
-    fe::Scene loaded;
-    fe::SceneSerializer::loadFromFile(loaded, "test_scene.fescene");
-    FE_INFO("Round-trip OK: loaded scene has '%s' with %zu entities",
-            loaded.name().c_str(),
-            loaded.registry().storage<entt::entity>().size());
-  }
-  bool     running    = true;
-  uint64_t frameCount = 0;
-  double   lastTime   = 0.0;
-  double   deltaTime  = 0.0;
-  while (running && !window.shouldClose()) {
-    const double now = glfwGetTime();
-    deltaTime = now - lastTime;
-    lastTime  = now;
-    ++frameCount;
-    window.pollEvents();
-    ImGui_ImplVulkan_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
-    ImGui::NewFrame();
-    beginDockspace(running);
-    // ---- Hierarchy panel ----
-    ImGui::Begin("Hierarchy");
-    ImGui::Text("Scene: %s", scene.name().c_str());
-    ImGui::Separator();
-    for (entt::entity e = scene.firstRoot(); e != entt::null;
-         e = scene.registry().get<fe::Relationship>(e).nextSibling)
-        drawHierarchyNode(scene, e);
-    ImGui::End();
-    // ---- Inspector panel ----
-    ImGui::Begin("Inspector");
-    ImGui::TextUnformatted("(select an entity)");
-    ImGui::End();
-    // ---- Viewport panel ----
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::Begin("Viewport");
+    // Resolve paths relative to the executable, not the working directory.
+    char exePathBuf[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePathBuf, MAX_PATH);
+    std::filesystem::path exeDir = std::filesystem::path(exePathBuf).parent_path();
+    std::filesystem::path shaderDir  = exeDir / "shaders";
+    std::filesystem::path assetsDir  = std::filesystem::current_path() / "assets";
 
-    ImVec2 panelSize = ImGui::GetContentRegionAvail();
-    uint32_t vpW = static_cast<uint32_t>(panelSize.x);
-    uint32_t vpH = static_cast<uint32_t>(panelSize.y);
+    FE_INFO("%s", fe::engineVersionString());
 
-    // Resize offscreen buffer when the panel changes size.
-    if (vpW > 0 && vpH > 0)
-        offscreen.resize(vpW, vpH);
+    fe::Window window;
+    if (!window.init(fe::WindowSpec{})) return 1;
 
-    // Display the offscreen image. Cast the descriptor set to ImTextureID.
-    ImGui::Image(
-        reinterpret_cast<ImTextureID>(offscreen.imguiDescriptorSet()),
-        panelSize);
+    fe::VulkanContext vkCtx;
+    if (!vkCtx.init(window)) return 1;
 
-    ImGui::End();
-    ImGui::PopStyleVar();
-    // ---- Statistics panel ----
-    ImGui::Begin("Statistics");
-    ImGui::Text("Frame time : %.3f ms", deltaTime * 1000.0);
-    ImGui::Text("FPS        : %.1f",    deltaTime > 0.0 ? 1.0 / deltaTime : 0.0);
-    ImGui::Text("Frame #    : %llu",    frameCount);
-    ImGui::Text("Entities   : %zu",     scene.registry().storage<entt::entity>().size());
-    ImGui::Text("Viewport   : %u x %u",
-                renderer.swapchainExtent().width,
-                renderer.swapchainExtent().height);
-    ImGui::End();
-    ImGui::Render();
-    if (!renderer.beginFrame()) continue;
+    fe::Renderer renderer;
+    if (!renderer.init(vkCtx, window)) return 1;
 
-    // 1. Offscreen pass — render the scene.
-    fe::Renderer::beginOffscreenPass(
-        renderer.currentCommandBuffer(),
-        offscreen.image(),
-        offscreen.imageView(),
-        {offscreen.width(), offscreen.height()});
-    
-    // (geometry draw calls will go here)
-    
-    fe::Renderer::endOffscreenPass(
-        renderer.currentCommandBuffer(),
-        offscreen.image());
-    
-    // 2. Swapchain pass — render ImGui on top.
-    renderer.beginSwapchainPass();
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
-                                    renderer.currentCommandBuffer());
-    renderer.endSwapchainPass();
-    
-    renderer.endFrame();
-  }
-  FE_INFO("Shutting down");
-  vkDeviceWaitIdle(vkCtx.device());
-  shutdownImGui(vkCtx.device());
-  offscreen.shutdown();
-  renderer.shutdown();
-  vkCtx.shutdown();
-  window.shutdown();
-  return 0;
+    if (!initImGui(vkCtx, window, renderer)) return 1;
+
+    fe::OffscreenBuffer offscreen;
+    if (!offscreen.init(vkCtx, 1280, 720)) return 1;
+
+    // Test mesh — a coloured cube.
+    const std::vector<fe::Vertex> cubeVertices = {
+        // Front face
+        {{-0.5f, -0.5f,  0.5f}, {1.0f, 0.0f, 0.0f}},
+        {{ 0.5f, -0.5f,  0.5f}, {0.0f, 1.0f, 0.0f}},
+        {{ 0.5f,  0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}},
+        {{-0.5f,  0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}},
+        // Back face
+        {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 1.0f}},
+        {{ 0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 1.0f}},
+        {{ 0.5f,  0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}},
+        {{-0.5f,  0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}},
+    };
+
+    const std::vector<uint32_t> cubeIndices = {
+        0,1,2, 2,3,0,  // front
+        4,6,5, 6,4,7,  // back
+        4,5,1, 1,0,4,  // bottom
+        3,2,6, 6,7,3,  // top
+        1,5,6, 6,2,1,  // right
+        4,0,3, 3,7,4,  // left
+    };
+
+    fe::MeshBuffer cubeMesh;
+    if (!cubeMesh.upload(vkCtx, cubeVertices, cubeIndices)) return 1;
+
+    fe::MeshPipeline meshPipeline;
+    if (!meshPipeline.init(vkCtx, fe::OffscreenBuffer::format(),
+                       shaderDir.string().c_str())) return 1;
+
+
+    fe::registerBuiltinComponents();
+
+    // Test scene.
+    fe::Scene        scene;
+    entt::entity     selectedEntity = entt::null;
+    scene.setName("Test Scene");
+    {
+        entt::entity root   = scene.create("Root");
+        entt::entity child  = scene.create("Child", root);
+        entt::entity camera = scene.create("Camera", root);
+        (void)child;
+        scene.registry().emplace<fe::CameraComponent>(camera);
+        scene.transform(camera).position = {0.0f, 5.0f, 10.0f};
+        scene.updateTransforms();
+
+        fe::SceneSerializer::saveToFile(scene, "test_scene.fescene");
+        fe::Scene loaded;
+        fe::SceneSerializer::loadFromFile(loaded, "test_scene.fescene");
+        FE_INFO("Round-trip OK: '%s' with %zu entities",
+                loaded.name().c_str(),
+                loaded.registry().storage<entt::entity>().size());
+    }
+
+    // Frame timing — declared before panels so StatisticsPanel can
+    // hold const references to them.
+    uint64_t frameCount = 0;
+    double   lastTime   = 0.0;
+    double   deltaTime  = 0.0;
+
+    // Panels — each owns references to its dependencies.
+    // Construction order does not matter; all dependencies are already alive.
+    fe::HierarchyPanel  hierarchyPanel {scene, selectedEntity};
+    fe::InspectorPanel  inspectorPanel {scene, selectedEntity};
+    fe::ViewportPanel   viewportPanel  {offscreen};
+    fe::StatisticsPanel statisticsPanel{scene, renderer, deltaTime, frameCount};
+    fe::AssetBrowser assetBrowser{assetsDir};
+
+    // Uniform panel array — adding a new panel is one line here.
+    fe::Panel* panels[] = {
+        &hierarchyPanel,
+        &inspectorPanel,
+        &viewportPanel,
+        &statisticsPanel,
+        &assetBrowser,
+    };
+
+    bool running = true;
+
+    while (running && !window.shouldClose()) {
+        const double now = glfwGetTime();
+        deltaTime = now - lastTime;
+        lastTime  = now;
+        ++frameCount;
+
+        window.pollEvents();
+
+        // ----- ImGui frame -----
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        beginDockspace(running);
+
+        for (auto* panel : panels)
+            panel->onImGui();
+
+        ImGui::Render();   // all panels must be submitted before this
+
+        // ----- GPU frame -----
+        if (!renderer.beginFrame()) continue;
+
+        // 1. Offscreen pass — scene geometry (placeholder clear for now).
+        fe::Renderer::beginOffscreenPass(
+            renderer.currentCommandBuffer(),
+            offscreen.image(),
+            offscreen.imageView(),
+            {offscreen.width(), offscreen.height()});
+
+        // Set viewport and scissor dynamically.
+        VkViewport vp{};
+        vp.width    = static_cast<float>(offscreen.width());
+        vp.height   = static_cast<float>(offscreen.height());
+        vp.minDepth = 0.0f;
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(renderer.currentCommandBuffer(), 0, 1, &vp);
+
+        VkRect2D scissor{};
+        scissor.extent = {offscreen.width(), offscreen.height()};
+        vkCmdSetScissor(renderer.currentCommandBuffer(), 0, 1, &scissor);
+
+        // Rotate the cube over time.
+        float angle = static_cast<float>(glfwGetTime());
+        glm::mat4 model = glm::rotate(glm::mat4(1.0f), angle,
+                                       glm::vec3(0.5f, 1.0f, 0.0f));
+        glm::mat4 view  = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f),
+                                       glm::vec3(0.0f, 0.0f, 0.0f),
+                                       glm::vec3(0.0f, 1.0f, 0.0f));
+        glm::mat4 proj  = glm::perspective(
+            glm::radians(60.0f),
+            static_cast<float>(offscreen.width()) /
+            static_cast<float>(offscreen.height()),
+            0.1f, 100.0f);
+
+        fe::MeshPushConstants pc;
+        pc.mvp = proj * view * model;
+
+        meshPipeline.bind(renderer.currentCommandBuffer(), pc);
+        cubeMesh.draw(renderer.currentCommandBuffer());
+
+        fe::Renderer::endOffscreenPass(
+            renderer.currentCommandBuffer(),
+            offscreen.image());
+
+        // 2. Swapchain pass — ImGui on top of the offscreen image.
+        renderer.beginSwapchainPass();
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
+                                        renderer.currentCommandBuffer());
+        renderer.endSwapchainPass();
+
+        renderer.endFrame();
+    }
+
+    FE_INFO("Shutting down");
+    cubeMesh.destroy();
+    meshPipeline.shutdown();
+    vkDeviceWaitIdle(vkCtx.device());
+    offscreen.shutdown();
+    shutdownImGui(vkCtx.device());
+    renderer.shutdown();
+    vkCtx.shutdown();
+    window.shutdown();
+
+    return 0;
 }
