@@ -14,7 +14,8 @@
  * Adding a new component requires:
  *   1. Declaring the struct in Components.h.
  *   2. Adding NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE in Components.h.
- *   3. Adding an inspect() overload in Inspectors.cpp.
+ *   3. Adding a `bool inspect(T&)` overload in Inspectors.cpp that returns
+ *      `true` when the user changed a value.
  *   4. Calling ComponentRegistry::instance().add<T>() in
  *      registerBuiltinComponents().
  */
@@ -30,8 +31,8 @@ namespace fe {
 /**
  * @brief Metadata and runtime operations for a single component type.
  *
- * All function pointers are populated by ComponentRegistry::add<T>()
- * through lambda captures — no virtual dispatch, no RTTI.
+ * All function objects are populated by ComponentRegistry::add<T>()
+ * through lambda captures: no virtual dispatch, no RTTI.
  */
 struct ComponentMeta {
     std::string name;       ///< Identifier used in JSON and the UI.
@@ -52,8 +53,11 @@ struct ComponentMeta {
     /// Deserialises the component from @p j and emplaces it on @p e.
     std::function<void(entt::registry&, entt::entity, const json&)> load;
 
-    /// Draws the ImGui inspector widgets for the component.
-    std::function<void(entt::registry&, entt::entity)> inspect;
+    /**
+     * Draws the ImGui inspector widgets for the component.
+     * @return `true` if the user changed a value this frame.
+     */
+    std::function<bool(entt::registry&, entt::entity)> inspect;
 };
 
 /**
@@ -73,13 +77,13 @@ public:
     /**
      * @brief Registers a component type and generates its runtime operations.
      *
-     * @tparam T        The component struct to register.
-     * @param  name     The string identifier used in JSON and the UI.
+     * @tparam T         The component struct to register.
+     * @param  name      The string identifier used in JSON and the UI.
      * @param  removable Whether the inspector should show a Remove button.
      *
      * @note T must have:
      *   - nlohmann::json serialisation (to_json / from_json)
-     *   - An fe::inspect(T&) overload
+     *   - A `bool fe::inspect(T&)` overload
      */
     template <typename T>
     void add(const std::string& name, bool removable = true) {
@@ -108,7 +112,7 @@ public:
         };
 
         meta.inspect = [](entt::registry& reg, entt::entity e) {
-            fe::inspect(reg.get<T>(e));
+            return fe::inspect(reg.get<T>(e));
         };
 
         m_metas.push_back(std::move(meta));

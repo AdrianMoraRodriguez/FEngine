@@ -1,0 +1,382 @@
+#include "gfx/MeshLibrary.h"
+
+#include "gfx/Vertex.h"
+#include "import/ModelImporter.h"
+#include "core/Log.h"
+#include "core/PathUtil.h"
+
+#include <algorithm>
+#include <exception>
+#include <string>
+#include <vector>
+
+namespace fe {
+namespace {
+
+/// Top bit of an imported model's handle. Built-in handles are small numbers,
+/// so this bit tells the two kinds apart at a glance.
+constexpr AssetHandle kImportedBit = 0x8000000000000000ull;
+
+/// Handle for a model: a 64-bit FNV-1a hash of its relative path.
+/// The same path always gives the same handle, on any machine.
+AssetHandle hashPath(const std::string& relativePath) {
+    uint64_t hash = 14695981039346656037ull;
+    for (unsigned char c : relativePath) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    return hash | kImportedBit;
+}
+
+/// Bounding box of a vertex set, padded so flat meshes keep some thickness.
+Aabb computeBounds(const std::vector<Vertex>& vertices) {
+    Aabb box{vertices.front().position, vertices.front().position};
+    for (const Vertex& v : vertices) {
+        box.min = glm::min(box.min, v.position);
+        box.max = glm::max(box.max, v.position);
+    }
+
+    const glm::vec3 padding(0.01f);
+    box.min -= padding;
+    box.max += padding;
+    return box;
+}
+
+/// Appends one quad as two triangles.
+///
+/// The corners must be given counter-clockwise as seen from outside the
+/// surface. All four vertices share @p normal: a cube needs its own
+/// vertices per face, otherwise the normals would be averaged across the
+/// edges and the faces would look rounded instead of flat.
+void addFace(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+             const glm::vec3& a, const glm::vec3& b,
+             const glm::vec3& c, const glm::vec3& d,
+             const glm::vec3& normal, const glm::vec3& color) {
+    const uint32_t base = static_cast<uint32_t>(vertices.size());
+
+    vertices.push_back({a, normal, color});
+    vertices.push_back({b, normal, color});
+    vertices.push_back({c, normal, color});
+    vertices.push_back({d, normal, color});
+
+    const uint32_t quad[6] = {0, 1, 2, 2, 3, 0};
+    for (uint32_t i : quad)
+        indices.push_back(base + i);
+}
+
+/// @return `true` if the future holds a result (or an exception) already.
+template <typename T>
+bool isReady(const std::future<T>& future) {
+    return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Built-in primitives
+// ---------------------------------------------------------------------------
+
+bool MeshLibrary::init(const VulkanContext& ctx) {
+    m_ctx = &ctx;
+
+    // Unit cube centred on the origin: 6 faces x 4 vertices.
+    {
+        std::vector<Vertex>   vertices;
+        std::vector<uint32_t> indices;
+
+        const float     h = 0.5f;
+        const glm::vec3 color{0.85f};
+
+        addFace(vertices, indices, {-h,-h, h}, { h,-h, h}, { h, h, h}, {-h, h, h}, { 0, 0, 1}, color); // +Z
+        addFace(vertices, indices, { h,-h,-h}, {-h,-h,-h}, {-h, h,-h}, { h, h,-h}, { 0, 0,-1}, color); // -Z
+        addFace(vertices, indices, { h,-h, h}, { h,-h,-h}, { h, h,-h}, { h, h, h}, { 1, 0, 0}, color); // +X
+        addFace(vertices, indices, {-h,-h,-h}, {-h,-h, h}, {-h, h, h}, {-h, h,-h}, {-1, 0, 0}, color); // -X
+        addFace(vertices, indices, {-h, h, h}, { h, h, h}, { h, h,-h}, {-h, h,-h}, { 0, 1, 0}, color); // +Y
+        addFace(vertices, indices, {-h,-h,-h}, { h,-h,-h}, { h,-h, h}, {-h,-h, h}, { 0,-1, 0}, color); // -Y
+
+        if (!m_cube.upload(ctx, vertices, indices)) return false;
+        m_cubeBounds = computeBounds(vertices);
+    }
+
+    // Unit plane in XZ facing +Y (visible from above only: back faces are culled).
+    {
+        const glm::vec3 up{0.0f, 1.0f, 0.0f};
+        const glm::vec3 grey{0.35f};
+
+        const std::vector<Vertex> vertices = {
+            {{-0.5f, 0.0f, -0.5f}, up, grey},
+            {{ 0.5f, 0.0f, -0.5f}, up, grey},
+            {{ 0.5f, 0.0f,  0.5f}, up, grey},
+            {{-0.5f, 0.0f,  0.5f}, up, grey},
+        };
+        const std::vector<uint32_t> indices = {0, 3, 2, 0, 2, 1};
+
+        if (!m_plane.upload(ctx, vertices, indices)) return false;
+        m_planeBounds = computeBounds(vertices);
+    }
+
+    return true;
+}
+
+void MeshLibrary::shutdown() {
+    // Ask every running import to stop first, so that waiting for them below
+    // does not mean waiting for a 400 MB file to finish. Destroying a future
+    // that comes from std::async waits for its task, so no background import
+    // outlives the library.
+    for (auto& entry : m_pending)
+        if (entry.second.control) entry.second.control->cancelRequested = true;
+    for (auto& entry : m_abandoned)
+        if (entry.control) entry.control->cancelRequested = true;
+
+    m_pending.clear();
+    m_abandoned.clear();
+
+    m_cube.destroy();
+    m_plane.destroy();
+
+    for (auto& entry : m_imported)
+        entry.second.buffer.destroy();
+    m_imported.clear();
+
+    m_ctx = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Imported models
+// ---------------------------------------------------------------------------
+
+void MeshLibrary::setAssetRoot(std::filesystem::path root) {
+    m_assetRoot = std::move(root);
+}
+
+AssetHandle MeshLibrary::registerModel(const std::filesystem::path& file) {
+    std::error_code ec;
+    const std::filesystem::path relative =
+        std::filesystem::relative(file, m_assetRoot, ec);
+
+    // A path that has to climb out of the asset root ("..") is not a project asset.
+    if (ec || relative.empty() || *relative.begin() == "..") {
+        FE_WARN("MeshLibrary: '%s' is not inside the asset folder", toUtf8(file).c_str());
+        return builtin::MeshNone;
+    }
+
+    const AssetHandle handle = hashPath(toGenericUtf8(relative));
+    m_sources[handle] = relative;
+    return handle;
+}
+
+void MeshLibrary::scanAssets() {
+    std::error_code ec;
+    if (m_assetRoot.empty() || !std::filesystem::exists(m_assetRoot, ec)) return;
+
+    // The iterator is advanced with increment(ec) instead of the range-for
+    // operator++, because that one throws if a single entry cannot be read
+    // (a name too long for Windows, a locked folder...). One bad file must
+    // not stop the editor from starting.
+    size_t found = 0;
+    std::filesystem::recursive_directory_iterator it(
+        m_assetRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+    const std::filesystem::recursive_directory_iterator end;
+
+    for (; !ec && it != end; it.increment(ec)) {
+        std::error_code entryEc;
+        if (it->is_regular_file(entryEc) && isSupportedModel(it->path())) {
+            registerModel(it->path());
+            ++found;
+        }
+    }
+
+    if (ec)
+        FE_WARN("MeshLibrary: stopped scanning assets early: %s", ec.message().c_str());
+
+    FE_INFO("MeshLibrary: found %zu model file(s) in '%s'",
+            found, toUtf8(m_assetRoot).c_str());
+}
+
+void MeshLibrary::beginFrame() {
+    m_used.clear();
+
+    // Release the results of cancelled imports whose thread has now stopped.
+    // Discarding the value is what frees its memory.
+    std::erase_if(m_abandoned, [](AbandonedImport& job) {
+        if (!isReady(job.future)) return false;
+        job.future.get();
+        return true;
+    });
+}
+
+bool MeshLibrary::ensureLoaded(AssetHandle handle) {
+    // Built-in handles (and "none") are small numbers and always ready.
+    if ((handle & kImportedBit) == 0) return true;
+
+    m_used.insert(handle);
+
+    if (m_imported.count(handle)) return true;
+    if (m_failed.count(handle))   return false;
+
+    // ---- An import is already running: has it finished? ----
+    const auto pending = m_pending.find(handle);
+    if (pending != m_pending.end()) {
+        if (!isReady(pending->second.future))
+            return false;   // still working; the entity is simply not drawn yet
+
+        const auto started = pending->second.started;
+        std::optional<MeshData> data = pending->second.future.get();
+        m_pending.erase(pending);
+
+        if (!data) {
+            m_failed.insert(handle);   // the importer already logged the reason
+            return false;
+        }
+
+        // Only the upload runs here: try_emplace builds the entry in place,
+        // because MeshBuffer cannot be copied.
+        auto [entry, inserted] = m_imported.try_emplace(handle);
+        if (!entry->second.buffer.upload(*m_ctx, data->vertices, data->indices)) {
+            m_imported.erase(entry);
+            m_failed.insert(handle);
+            return false;
+        }
+        entry->second.bounds = computeBounds(data->vertices);
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+
+        FE_INFO("Imported '%s': %zu vertices, %zu triangles, in %lld ms",
+                toGenericUtf8(m_sources[handle]).c_str(),
+                data->vertices.size(), data->indices.size() / 3,
+                static_cast<long long>(elapsed.count()));
+        return true;
+    }
+
+    // ---- Cancelled by the user: waits for confirmImport() ----
+    if (m_declined.count(handle)) return false;
+
+    // ---- Not started yet: find the file and start reading it ----
+    const auto source = m_sources.find(handle);
+    if (source == m_sources.end()) {
+        FE_WARN("MeshLibrary: no model is registered for mesh %llx "
+                "(was the file moved or deleted?)",
+                static_cast<unsigned long long>(handle));
+        m_failed.insert(handle);
+        return false;
+    }
+
+    const std::filesystem::path file = m_assetRoot / source->second;
+
+    std::error_code sizeEc;
+    const std::uintmax_t bytes = std::filesystem::file_size(file, sizeEc);
+
+    FE_INFO("Importing '%s' (%.1f MB)...", toGenericUtf8(source->second).c_str(),
+            sizeEc ? 0.0 : static_cast<double>(bytes) / (1024.0 * 1024.0));
+
+    PendingImport job;
+    job.started = std::chrono::steady_clock::now();
+    job.control = std::make_shared<ImportControl>();
+    job.bytes   = sizeEc ? 0 : bytes;
+
+    // The task only touches its own local data, the shared ImportControl and
+    // the (thread-safe) log, so it needs no access to the library. It must
+    // also never let an exception escape: on a background thread that would
+    // take the program down.
+    job.future = std::async(std::launch::async,
+        [file, control = job.control]() -> std::optional<MeshData> {
+            try {
+                return importModel(file, control.get());
+            } catch (const std::exception& e) {
+                FE_ERROR("Importing '%s' failed: %s", toUtf8(file).c_str(), e.what());
+            } catch (...) {
+                FE_ERROR("Importing '%s' failed with an unknown error", toUtf8(file).c_str());
+            }
+            return std::nullopt;
+        });
+
+    m_pending.emplace(handle, std::move(job));
+    return false;
+}
+
+std::vector<ImportStatus> MeshLibrary::importStatuses() const {
+    std::vector<ImportStatus> list;
+
+    for (AssetHandle handle : m_used) {
+        if (m_imported.count(handle)) continue;
+
+        ImportStatus status;
+        status.handle = handle;
+
+        const auto source = m_sources.find(handle);
+        status.name = (source != m_sources.end()) ? toUtf8(source->second.filename())
+                                                  : std::string("(unknown model)");
+
+        if (const auto pending = m_pending.find(handle); pending != m_pending.end()) {
+            status.state    = ImportState::Loading;
+            status.progress = pending->second.control->progress.load(std::memory_order_relaxed);
+            status.bytes    = pending->second.bytes;
+        } else if (m_declined.count(handle)) {
+            status.state = ImportState::Declined;
+        } else if (m_failed.count(handle)) {
+            status.state = ImportState::Failed;
+        } else {
+            continue;   // about to start; nothing to show yet
+        }
+
+        list.push_back(std::move(status));
+    }
+
+    std::sort(list.begin(), list.end(),
+              [](const ImportStatus& a, const ImportStatus& b) {
+                  return a.name != b.name ? a.name < b.name : a.handle < b.handle;
+              });
+    return list;
+}
+
+void MeshLibrary::confirmImport(AssetHandle handle) {
+    m_declined.erase(handle);   // ensureLoaded() starts it on the next frame
+}
+
+void MeshLibrary::cancelImport(AssetHandle handle) {
+    if (const auto pending = m_pending.find(handle); pending != m_pending.end()) {
+        pending->second.control->cancelRequested = true;
+
+        // The editor does not wait for the thread: Assimp may need a while to
+        // reach a point where it can stop. The future is parked here and its
+        // result is thrown away by beginFrame() once it is ready.
+        m_abandoned.push_back({std::move(pending->second.future), pending->second.control});
+        m_pending.erase(pending);
+        FE_INFO("Import of '%s' cancelled", toGenericUtf8(m_sources[handle]).c_str());
+    }
+
+    m_declined.insert(handle);
+}
+
+// ---------------------------------------------------------------------------
+// Lookup
+// ---------------------------------------------------------------------------
+
+const MeshBuffer* MeshLibrary::get(AssetHandle handle) const {
+    switch (handle) {
+        case builtin::MeshCube:  return m_cube.isValid()  ? &m_cube  : nullptr;
+        case builtin::MeshPlane: return m_plane.isValid() ? &m_plane : nullptr;
+        case builtin::MeshNone:  return nullptr;
+        default: {
+            const auto it = m_imported.find(handle);
+            return (it != m_imported.end() && it->second.buffer.isValid())
+                       ? &it->second.buffer : nullptr;
+        }
+    }
+}
+
+std::optional<Aabb> MeshLibrary::bounds(AssetHandle handle) const {
+    switch (handle) {
+        case builtin::MeshCube:  return m_cube.isValid()  ? std::optional<Aabb>(m_cubeBounds)  : std::nullopt;
+        case builtin::MeshPlane: return m_plane.isValid() ? std::optional<Aabb>(m_planeBounds) : std::nullopt;
+        case builtin::MeshNone:  return std::nullopt;
+        default: {
+            const auto it = m_imported.find(handle);
+            return it != m_imported.end() ? std::optional<Aabb>(it->second.bounds)
+                                          : std::nullopt;
+        }
+    }
+}
+
+} // namespace fe

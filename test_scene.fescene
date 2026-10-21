@@ -2,13 +2,50 @@
   "entities": [
     {
       "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 2
+        },
         "Name": {
-          "name": "Root"
+          "name": "Ground"
         },
         "Transform": {
           "position": [
             0.0,
             0.0,
+            0.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            10.0,
+            1.0,
+            10.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 16954147421013672067
+    },
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 1
+        },
+        "Name": {
+          "name": "Cube"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.5,
             0.0
           ],
           "rotation": [
@@ -25,18 +62,23 @@
         }
       },
       "parent": 0,
-      "uuid": 12462340078111204159
+      "uuid": 8425207945807176905
     },
     {
       "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 1
+        },
         "Name": {
-          "name": "Child"
+          "name": "Small Cube"
         },
         "Transform": {
           "position": [
-            0.0,
-            0.0,
-            0.0
+            1.2000000476837158,
+            0.30000001192092896,
+            0.6000000238418579
           ],
           "rotation": [
             1.0,
@@ -45,14 +87,14 @@
             0.0
           ],
           "scale": [
-            1.0,
-            1.0,
-            1.0
+            0.6000000238418579,
+            0.6000000238418579,
+            0.6000000238418579
           ]
         }
       },
-      "parent": 12462340078111204159,
-      "uuid": 17142909641760828147
+      "parent": 0,
+      "uuid": 9957692985671997713
     },
     {
       "components": {
@@ -84,8 +126,8 @@
           ]
         }
       },
-      "parent": 12462340078111204159,
-      "uuid": 15130076192125258176
+      "parent": 0,
+      "uuid": 15296187890493341811
     }
   ],
   "name": "Test Scene",

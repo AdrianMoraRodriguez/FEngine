@@ -14,6 +14,8 @@ find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(EnTT CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
+find_package(imguizmo CONFIG REQUIRED)
+find_package(assimp CONFIG REQUIRED)
 
 target_link_libraries(FEngine PUBLIC
                         glfw
@@ -24,7 +26,7 @@ target_link_libraries(FEngine PUBLIC
                         EnTT::EnTT
                         nlohmann_json::nlohmann_json)
 
-target_link_libraries(FEngine PRIVATE imgui::imgui)
+target_link_libraries(FEngine PRIVATE imgui::imgui imguizmo::imguizmo assimp::assimp)
 
 target_compile_definitions(FEngine PUBLIC
                             GLM_FORCE_DEPTH_ZERO_TO_ONE

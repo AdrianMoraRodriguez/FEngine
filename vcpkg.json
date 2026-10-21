@@ -11,6 +11,9 @@
     "vulkan-memory-allocator",
     "entt",
     "nlohmann-json",
+    "imguizmo",
+    "cgltf",
+    "assimp",
     {
       "name": "imgui",
       "features": [

@@ -1,11 +1,12 @@
 #include "gfx/MeshPipeline.h"
+
 #include "gfx/VulkanContext.h"
 #include "gfx/Vertex.h"
 #include "core/Log.h"
 
 #include <fstream>
-#include <vector>
 #include <string>
+#include <vector>
 
 namespace fe {
 namespace {
@@ -16,7 +17,7 @@ std::vector<char> readFile(const std::string& path) {
         FE_ERROR("MeshPipeline: cannot open shader file '%s'", path.c_str());
         return {};
     }
-    size_t size = static_cast<size_t>(file.tellg());
+    const size_t size = static_cast<size_t>(file.tellg());
     std::vector<char> buf(size);
     file.seekg(0);
     file.read(buf.data(), static_cast<std::streamsize>(size));
@@ -61,6 +62,7 @@ VkShaderModule MeshPipeline::loadShader(const char* path) const {
 
 bool MeshPipeline::init(const VulkanContext& ctx,
                         VkFormat colorFormat,
+                        VkFormat depthFormat,
                         const char* shaderDir) {
     m_ctx = &ctx;
 
@@ -70,8 +72,8 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     VkShaderModule frag = loadShader((dir + "/mesh.frag.spv").c_str());
 
     if (!vert || !frag) {
-        vkDestroyShaderModule(ctx.device(), vert, nullptr);
-        vkDestroyShaderModule(ctx.device(), frag, nullptr);
+        if (vert) vkDestroyShaderModule(ctx.device(), vert, nullptr);
+        if (frag) vkDestroyShaderModule(ctx.device(), frag, nullptr);
         return false;
     }
 
@@ -109,6 +111,8 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     viewportState.scissorCount  = 1;
 
     // ---- Rasteriser ----
+    // Front faces are counter-clockwise as seen on screen. This only holds
+    // because the projection matrix flips Y (see EditorCamera::projection).
     VkPipelineRasterizationStateCreateInfo rasteriser{};
     rasteriser.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasteriser.polygonMode = VK_POLYGON_MODE_FILL;
@@ -121,6 +125,15 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+    // ---- Depth test ----
+    // Depth range is [0, 1] (GLM_FORCE_DEPTH_ZERO_TO_ONE); nearer fragments
+    // have smaller values, so LESS keeps the closest surface.
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable  = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp   = VK_COMPARE_OP_LESS;
+
     // ---- Colour blending (opaque) ----
     VkPipelineColorBlendAttachmentState blendAttachment{};
     blendAttachment.colorWriteMask =
@@ -132,7 +145,7 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     blending.attachmentCount = 1;
     blending.pAttachments    = &blendAttachment;
 
-    // ---- Dynamic state (viewport + scissor set at draw time) ----
+    // ---- Dynamic state ----
     VkDynamicState dynamicStates[] = {
         VK_DYNAMIC_STATE_VIEWPORT,
         VK_DYNAMIC_STATE_SCISSOR,
@@ -156,14 +169,17 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     if (vkCreatePipelineLayout(ctx.device(), &layoutInfo, nullptr,
                                &m_layout) != VK_SUCCESS) {
         FE_ERROR("MeshPipeline: failed to create pipeline layout");
+        vkDestroyShaderModule(ctx.device(), vert, nullptr);
+        vkDestroyShaderModule(ctx.device(), frag, nullptr);
         return false;
     }
 
-    // ---- Dynamic rendering attachment info ----
+    // ---- Dynamic rendering attachment formats ----
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingInfo.colorAttachmentCount    = 1;
     renderingInfo.pColorAttachmentFormats = &colorFormat;
+    renderingInfo.depthAttachmentFormat   = depthFormat;
 
     // ---- Create the pipeline ----
     VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -176,28 +192,43 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     pipelineInfo.pViewportState      = &viewportState;
     pipelineInfo.pRasterizationState = &rasteriser;
     pipelineInfo.pMultisampleState   = &multisampling;
+    pipelineInfo.pDepthStencilState  = &depthStencil;
     pipelineInfo.pColorBlendState    = &blending;
     pipelineInfo.pDynamicState       = &dynamicState;
     pipelineInfo.layout              = m_layout;
 
-    if (vkCreateGraphicsPipelines(ctx.device(), VK_NULL_HANDLE, 1,
-                                  &pipelineInfo, nullptr,
-                                  &m_pipeline) != VK_SUCCESS) {
+    const VkResult result = vkCreateGraphicsPipelines(
+        ctx.device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
+
+    // Shader modules are no longer needed once the pipeline exists.
+    vkDestroyShaderModule(ctx.device(), vert, nullptr);
+    vkDestroyShaderModule(ctx.device(), frag, nullptr);
+
+    if (result != VK_SUCCESS) {
         FE_ERROR("MeshPipeline: failed to create graphics pipeline");
         return false;
     }
-
-    vkDestroyShaderModule(ctx.device(), vert, nullptr);
-    vkDestroyShaderModule(ctx.device(), frag, nullptr);
 
     FE_INFO("MeshPipeline: created successfully");
     return true;
 }
 
-void MeshPipeline::bind(VkCommandBuffer cmd,
-                        const MeshPushConstants& pc) const {
+void MeshPipeline::bind(VkCommandBuffer cmd, VkExtent2D extent) const {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
+    VkViewport viewport{};
+    viewport.width    = static_cast<float>(extent.width);
+    viewport.height   = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.extent = extent;
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+void MeshPipeline::push(VkCommandBuffer cmd, const MeshPushConstants& pc) const {
     vkCmdPushConstants(cmd, m_layout, VK_SHADER_STAGE_VERTEX_BIT,
                        0, sizeof(MeshPushConstants), &pc);
 }

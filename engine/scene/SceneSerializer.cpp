@@ -17,7 +17,7 @@ void saveEntity(const Scene& scene, entt::entity e, json& array) {
     json je;
     je["uuid"] = reg.get<IDComponent>(e).uuid;
 
-    // Parent UUID — zero means "no parent" (root entity).
+    // Parent UUID: zero means "no parent" (root entity).
     entt::entity parent = reg.get<Relationship>(e).parent;
     je["parent"] = (parent != entt::null)
         ? reg.get<IDComponent>(parent).uuid
@@ -43,8 +43,7 @@ void saveEntity(const Scene& scene, entt::entity e, json& array) {
 
 } // namespace
 
-bool SceneSerializer::saveToFile(const Scene& scene,
-                                 const std::filesystem::path& path) {
+std::string SceneSerializer::serialize(const Scene& scene) {
     json out;
     out["version"]  = 1;
     out["name"]     = scene.name();
@@ -55,6 +54,11 @@ bool SceneSerializer::saveToFile(const Scene& scene,
          e = reg.get<Relationship>(e).nextSibling)
         saveEntity(scene, e, out["entities"]);
 
+    return out.dump(2);
+}
+
+bool SceneSerializer::saveToFile(const Scene& scene,
+                                 const std::filesystem::path& path) {
     std::ofstream file(path);
     if (!file) {
         FE_ERROR("SceneSerializer: cannot open '%s' for writing",
@@ -62,12 +66,16 @@ bool SceneSerializer::saveToFile(const Scene& scene,
         return false;
     }
 
-    file << out.dump(2);   // 2-space indentation for readability
+    file << serialize(scene);
+    file.flush();
+    if (!file) {
+        FE_ERROR("SceneSerializer: failed while writing '%s'",
+                 path.string().c_str());
+        return false;
+    }
 
-    FE_INFO("Scene '%s' saved to '%s' (%zu entities)",
-            scene.name().c_str(),
-            path.string().c_str(),
-            out["entities"].size());
+    FE_INFO("Scene '%s' saved to '%s'",
+            scene.name().c_str(), path.string().c_str());
     return true;
 }
 
@@ -80,59 +88,58 @@ bool SceneSerializer::loadFromFile(Scene& scene,
         return false;
     }
 
-    json in;
+    // Any malformed or incomplete content surfaces as a json::exception
+    // (missing keys, wrong types), so the whole load is guarded: a bad file
+    // must be rejected, never crash the editor.
     try {
+        json in;
         file >> in;
+
+        if (in.value("version", 0) != 1) {
+            FE_ERROR("SceneSerializer: unsupported scene version in '%s'",
+                     path.string().c_str());
+            return false;
+        }
+
+        scene.setName(in.value("name", std::string{"Untitled"}));
+
+        // Entities are stored in depth-first order (parents before
+        // children), so resolving the parent UUID always succeeds.
+        for (const auto& je : in.at("entities")) {
+            UUID uuid     = je.at("uuid").get<UUID>();
+            UUID parentId = je.value("parent", UUID(0));
+
+            entt::entity parent = (parentId != 0)
+                ? scene.findByUUID(parentId)
+                : entt::null;
+
+            std::string name = "Entity";
+            const auto& comps = je.at("components");
+            if (comps.contains("Name"))
+                name = comps.at("Name").at("name").get<std::string>();
+
+            entt::entity e = scene.createWithUUID(uuid, name, parent);
+
+            for (auto it = comps.begin(); it != comps.end(); ++it) {
+                const ComponentMeta* meta =
+                    ComponentRegistry::instance().find(it.key());
+                if (meta)
+                    meta->load(scene.registry(), e, it.value());
+                else
+                    FE_WARN("SceneSerializer: unknown component '%s' skipped",
+                            it.key().c_str());
+            }
+
+            scene.registry().get<WorldTransform>(e).dirty = true;
+        }
     } catch (const json::exception& ex) {
-        FE_ERROR("SceneSerializer: JSON parse error in '%s': %s",
+        FE_ERROR("SceneSerializer: invalid scene file '%s': %s",
                  path.string().c_str(), ex.what());
         return false;
     }
 
-    if (in.value("version", 0) != 1) {
-        FE_ERROR("SceneSerializer: unsupported scene version in '%s'",
-                 path.string().c_str());
-        return false;
-    }
-
-    scene.setName(in.value("name", std::string{"Untitled"}));
-
-    // Entities are stored in depth-first order (parents before children),
-    // so resolving the parent UUID always succeeds on the first pass.
-    for (const auto& je : in.at("entities")) {
-        UUID uuid     = je.at("uuid").get<UUID>();
-        UUID parentId = je.value("parent", UUID(0));
-
-        entt::entity parent = (parentId != 0)
-            ? scene.findByUUID(parentId)
-            : entt::null;
-
-        // Recover the display name from the serialised Name component.
-        std::string name = "Entity";
-        const auto& comps = je.at("components");
-        if (comps.contains("Name"))
-            name = comps.at("Name").at("name").get<std::string>();
-
-        entt::entity e = scene.createWithUUID(uuid, name, parent);
-
-        // Deserialise all components found in the file.
-        for (auto it = comps.begin(); it != comps.end(); ++it) {
-            const ComponentMeta* meta =
-                ComponentRegistry::instance().find(it.key());
-            if (meta)
-                meta->load(scene.registry(), e, it.value());
-            else
-                FE_WARN("SceneSerializer: unknown component '%s' — skipped",
-                        it.key().c_str());
-        }
-
-        scene.registry().get<WorldTransform>(e).dirty = true;
-    }
-
-    FE_INFO("Scene '%s' loaded from '%s' (%zu entities)",
-            scene.name().c_str(),
-            path.string().c_str(),
-            in["entities"].size());
+    FE_INFO("Scene '%s' loaded from '%s'",
+            scene.name().c_str(), path.string().c_str());
     return true;
 }
 

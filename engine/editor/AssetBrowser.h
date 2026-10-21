@@ -7,18 +7,22 @@
  * Displays the contents of the project asset root in a two-column layout:
  * a folder tree on the left and a grid of file icons on the right.
  * The user navigates folders by clicking them and can select individual
- * files (selection drives future drag-and-drop into the viewport or
- * inspector).
+ * files.
+ *
+ * Model files the engine can import (see isSupportedModel()) can be dragged
+ * out of the grid and dropped
+ * into the viewport to add them to the scene. The drag carries the file's
+ * absolute path, as UTF-8 text, in a payload named "FE_MODEL".
  *
  * The browser is read-only for now: it reflects the file system but does
  * not create, rename or delete files.
  */
 
-#include <filesystem>
-#include <vector>
-#include <string>
-
 #include "editor/Panel.h"
+
+#include <filesystem>
+#include <string>
+#include <vector>
 
 namespace fe {
 
@@ -33,11 +37,6 @@ struct AssetEntry {
 
 /**
  * @brief ImGui panel that browses the project asset directory.
- *
- * Typical use — call once per frame inside an ImGui::Begin/End pair:
- * @code
- * assetBrowser.onImGui();
- * @endcode
  */
 class AssetBrowser : public Panel {
 public:
@@ -55,13 +54,13 @@ public:
      * Must be called between ImGui::NewFrame() and ImGui::Render().
      * Opens its own ImGui::Begin/End window named "Asset Browser".
      */
-    void onImGui();
+    void onImGui() override;
 
     /**
      * @brief Returns the currently selected file, or an empty path if none.
      *
      * The selection changes when the user single-clicks a file entry.
-     * Directories are never reported as the selected file — clicking a
+     * Directories are never reported as the selected file: clicking a
      * directory navigates into it instead.
      */
     const std::filesystem::path& selectedPath() const { return m_selected; }
@@ -79,10 +78,11 @@ private:
     /// Returns a short icon string for @p entry based on its extension.
     static const char* iconFor(const AssetEntry& entry);
 
-    std::filesystem::path        m_root;        ///< Asset root (never navigated above).
-    std::filesystem::path        m_currentDir;  ///< Directory currently shown in the grid.
-    std::filesystem::path        m_selected;    ///< Currently selected file, or empty.
-    std::vector<AssetEntry>      m_entries;     ///< Cached contents of m_currentDir.
+    std::filesystem::path   m_root;        ///< Asset root (never navigated above).
+    std::filesystem::path   m_currentDir;  ///< Directory currently shown in the grid.
+    std::filesystem::path   m_selected;    ///< Currently selected file, or empty.
+    std::vector<AssetEntry> m_entries;     ///< Cached contents of m_currentDir.
+    std::filesystem::path m_pendingDir;
 };
 
 } // namespace fe

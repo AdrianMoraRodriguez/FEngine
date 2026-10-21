@@ -18,11 +18,9 @@
  *       "parent": 0,
  *       "components": {
  *         "Name":      { "name": "Root" },
- *         "Transform": { "position": [0,0,0], ... },
- *         "Camera":    { "fovDegrees": 60, ... }
+ *         "Transform": { "position": [0,0,0], ... }
  *       }
- *     },
- *     ...
+ *     }
  *   ]
  * }
  * @endcode
@@ -35,17 +33,30 @@
 #include "scene/Scene.h"
 
 #include <filesystem>
+#include <string>
 
 namespace fe {
 
 /**
- * @brief Serialises and deserialises Scene objects to disk.
+ * @brief Serialises and deserialises Scene objects.
  *
  * Uses ComponentRegistry to discover which components each entity has,
  * so adding a new component type requires no changes here.
  */
 class SceneSerializer {
 public:
+    /**
+     * @brief Serialises the scene to a JSON string.
+     *
+     * The output is deterministic: the same scene always produces the same
+     * text. The editor relies on this to detect unsaved changes by comparing
+     * the current text with the text of the last save.
+     *
+     * @param scene The scene to serialise.
+     * @return The JSON document, indented with two spaces.
+     */
+    static std::string serialize(const Scene& scene);
+
     /**
      * @brief Writes the scene to a JSON file.
      *
@@ -59,8 +70,10 @@ public:
     /**
      * @brief Populates a scene from a JSON file.
      *
-     * The scene is not cleared before loading — call this on a freshly
-     * constructed Scene to get a clean result.
+     * The scene is not cleared before loading, so call this on a freshly
+     * constructed Scene. Malformed files are rejected without throwing: on
+     * failure the function returns `false` and @p scene must be discarded,
+     * as it may be partially populated.
      *
      * @param scene The scene to populate.
      * @param path  Source file path.

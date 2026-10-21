@@ -2,7 +2,7 @@
 
 /**
  * @file Renderer.h
- * @brief Swapchain management and per-frame rendering resources.
+ * @brief Swapchain management, per-frame resources and render passes.
  */
 
 #include <vulkan/vulkan.h>
@@ -13,25 +13,17 @@ namespace fe {
 
 class VulkanContext;
 class Window;
+class OffscreenBuffer;
 
 /**
  * @brief Per-frame GPU resources.
  *
- * Each frame in flight owns its own command pool and synchronisation
- * primitives. This allows the CPU to record the next frame while the
- * GPU is still executing the previous one.
- *
- * @note imageAvailableSemaphore has been removed from this struct.
- *       Acquisition semaphores are now stored per-frame-slot in
- *       Renderer::m_imageAvailableSemaphores, indexed by m_currentFrame,
- *       to avoid reusing a semaphore still in use by the swapchain.
+ * Each frame in flight owns its own command pool and fence, so the CPU can
+ * record the next frame while the GPU is still executing the previous one.
  */
 struct FrameData {
     VkCommandPool   commandPool   = VK_NULL_HANDLE; ///< Pool for commandBuffer.
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE; ///< Primary command buffer.
-
-    /// Signalled by the GPU when all rendering commands have finished.
-    VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
 
     /// CPU-side fence. Waited on before reusing this frame slot.
     VkFence inFlightFence = VK_NULL_HANDLE;
@@ -40,26 +32,36 @@ struct FrameData {
 /**
  * @brief Manages the swapchain, per-frame resources, and the frame loop.
  *
- * Exposes a beginFrame() / endFrame() pair. Between those two calls the
- * caller records rendering commands into currentCommandBuffer().
+ * A frame is recorded as:
+ * @code
+ * if (!renderer.beginFrame()) continue;
+ *
+ * Renderer::beginOffscreenPass(cmd, offscreen);   // scene
+ * // ... draw calls ...
+ * Renderer::endOffscreenPass(cmd, offscreen);
+ *
+ * renderer.beginSwapchainPass();                  // UI on top
+ * // ... ImGui draw data ...
+ * renderer.endSwapchainPass();
+ *
+ * renderer.endFrame();
+ * @endcode
  *
  * Uses Vulkan 1.3 dynamic rendering: no VkRenderPass or VkFramebuffer.
  *
  * ### Semaphore strategy
- * One `imageAvailableSemaphore` per frame slot (not per swapchain image).
- * Because MAX_FRAMES_IN_FLIGHT (2) < swapchain image count (3), no two
- * active frame slots can reference the same swapchain image simultaneously,
- * so the semaphore is always free by the time it is reused.
+ * The two semaphores of a frame follow different rules, because they are
+ * reused at different moments:
  *
- * Typical render loop:
- * @code
- * while (!window.shouldClose()) {
- *     window.pollEvents();
- *     if (!renderer.beginFrame()) continue;
- *     // record into renderer.currentCommandBuffer()
- *     renderer.endFrame();
- * }
- * @endcode
+ *   - **imageAvailable** (the swapchain tells the GPU an image is ready) is
+ *     kept per *frame slot*. It is safe to reuse once the slot's fence has
+ *     been waited on, which beginFrame() always does first.
+ *   - **renderFinished** (the GPU tells the presentation engine the image is
+ *     drawn) is kept per *swapchain image*. The presentation engine may still
+ *     be reading it long after the fence is signalled, and the only moment
+ *     that proves it is done is the moment the same image is acquired again.
+ *     Keeping it per frame slot instead lets it be signalled again while a
+ *     previous present still waits on it.
  */
 class Renderer {
 public:
@@ -76,7 +78,7 @@ public:
      * @brief Creates the swapchain and all per-frame resources.
      *
      * @param ctx    Initialised Vulkan context.
-     * @param window Window whose framebuffer the swapchain presents to.
+     * @param window Window the swapchain presents to.
      * @return `true` on success.
      */
     bool init(const VulkanContext& ctx, Window& window);
@@ -85,70 +87,48 @@ public:
     void shutdown();
 
     /**
-     * @brief Begins a new frame.
+     * @brief Begins a new frame and opens the command buffer.
      *
-     * Waits for the in-flight fence of the current slot, acquires a
-     * swapchain image, and opens the command buffer for recording.
-     * Starts a dynamic rendering pass cleared to the engine background colour.
+     * Waits for the current slot's fence, acquires a swapchain image and
+     * transitions it for rendering. No render pass is opened here.
      *
      * @return `false` if the frame must be skipped (minimised window or
      *         out-of-date swapchain). The caller should `continue`.
      */
     bool beginFrame();
 
-    /**
-     * @brief Ends the current frame: submits and presents.
-     *
-     * Closes the dynamic rendering pass, submits the command buffer,
-     * and presents the image. Recreates the swapchain when needed.
-     *
-     * Must only be called after a successful beginFrame().
-     */
+    /// Ends the frame: transitions the image, submits and presents.
     void endFrame();
 
-    /**
-     * @brief The command buffer open for recording during the current frame.
-     *
-     * Only valid between a successful beginFrame() and the matching endFrame().
-     */
-    VkCommandBuffer currentCommandBuffer() const;
+    /// Opens a render pass on the swapchain image (cleared to the editor background).
+    void beginSwapchainPass();
+
+    /// Closes the render pass opened by beginSwapchainPass().
+    void endSwapchainPass();
 
     /**
-     * @brief Begins a rendering pass into an offscreen image.
+     * @brief Opens a render pass on the offscreen colour + depth targets.
      *
-     * Records the layout transition and vkCmdBeginRendering targeting
-     * @p colorTarget. The caller records draw commands after this call.
+     * Transitions both images and clears them (colour to the scene
+     * background, depth to 1.0).
      *
-     * @param cmd         Command buffer to record into (from currentCommandBuffer()).
-     * @param colorTarget The image to render into.
-     * @param colorView   Image view of @p colorTarget.
-     * @param extent      Dimensions of the render area.
+     * @param cmd       Command buffer from currentCommandBuffer().
+     * @param offscreen Target buffer.
      */
     static void beginOffscreenPass(VkCommandBuffer cmd,
-                                   VkImage colorTarget,
-                                   VkImageView colorView,
-                                   VkExtent2D extent);
+                                   const OffscreenBuffer& offscreen);
 
     /**
-     * @brief Ends the offscreen rendering pass and transitions the image
-     *        to SHADER_READ_ONLY_OPTIMAL so ImGui can sample it.
+     * @brief Closes the offscreen pass and makes the colour image readable.
      *
-     * @param cmd         Command buffer (same one passed to beginOffscreenPass).
-     * @param colorTarget The image that was rendered into.
+     * Transitions the colour image to SHADER_READ_ONLY_OPTIMAL so ImGui can
+     * sample it.
      */
-    static void endOffscreenPass(VkCommandBuffer cmd, VkImage colorTarget);
+    static void endOffscreenPass(VkCommandBuffer cmd,
+                                 const OffscreenBuffer& offscreen);
 
-    /**
-     * @brief Opens the render pass targeting the current swapchain image.
-     *
-     * Must be called after all offscreen passes are done and before any
-     * commands that draw into the swapchain (e.g. ImGui).
-     * Clears the swapchain image to the editor background colour.
-     */
-    void beginSwapchainPass();
-        
-    /// @brief Closes the swapchain render pass opened by beginSwapchainPass().
-    void endSwapchainPass();
+    /// Command buffer open for recording during the current frame.
+    VkCommandBuffer currentCommandBuffer() const;
 
     /// @return Current swapchain image extent in pixels.
     VkExtent2D swapchainExtent() const { return m_swapchainExtent; }
@@ -164,15 +144,18 @@ private:
     const VulkanContext* m_ctx    = nullptr;
     Window*              m_window = nullptr;
 
-    VkSwapchainKHR           m_swapchain      = VK_NULL_HANDLE;
+    VkSwapchainKHR           m_swapchain       = VK_NULL_HANDLE;
     VkFormat                 m_swapchainFormat = VK_FORMAT_UNDEFINED;
     VkExtent2D               m_swapchainExtent = {0, 0};
     std::vector<VkImage>     m_swapchainImages;
     std::vector<VkImageView> m_swapchainImageViews;
 
-    /// One semaphore per frame slot. Signalled by the swapchain when the
-    /// acquired image is ready to write. Indexed by m_currentFrame.
+    /// One semaphore per frame slot, indexed by m_currentFrame.
     std::vector<VkSemaphore> m_imageAvailableSemaphores;
+
+    /// One semaphore per swapchain image, indexed by m_imageIndex.
+    /// Created and destroyed together with the swapchain.
+    std::vector<VkSemaphore> m_renderFinishedSemaphores;
 
     FrameData m_frames[MAX_FRAMES_IN_FLIGHT];
     uint32_t  m_currentFrame = 0;

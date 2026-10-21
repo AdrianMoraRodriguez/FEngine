@@ -1,0 +1,231 @@
+{
+  "entities": [
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 2
+        },
+        "Name": {
+          "name": "Ground"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            10.0,
+            1.0,
+            10.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 13900108082671790190
+    },
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 1
+        },
+        "Name": {
+          "name": "Cube"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.5,
+            0.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 638287234380602890
+    },
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 1
+        },
+        "Name": {
+          "name": "Small Cube"
+        },
+        "Transform": {
+          "position": [
+            1.2000000476837158,
+            0.30000001192092896,
+            0.6000000238418579
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            0.6000000238418579,
+            0.6000000238418579,
+            0.6000000238418579
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 16955578597829919575
+    },
+    {
+      "components": {
+        "Camera": {
+          "farPlane": 1000.0,
+          "fovDegrees": 60.0,
+          "nearPlane": 0.10000000149011612,
+          "primary": true
+        },
+        "Name": {
+          "name": "Camera"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            5.0,
+            10.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 891024305531675326
+    },
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 17893963603531862916
+        },
+        "Name": {
+          "name": "BoxCartridge"
+        },
+        "Transform": {
+          "position": [
+            0.25019001960754395,
+            2.384185791015625e-07,
+            2.6862998008728027
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 14932922719799462936
+    },
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 15466549172741761348
+        },
+        "Name": {
+          "name": "DamagedHelmet"
+        },
+        "Transform": {
+          "position": [
+            4.074726581573486,
+            0.776032567024231,
+            1.186293363571167
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 7105377864111911659
+    },
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 10628146637226648293
+        },
+        "Name": {
+          "name": "Pocketwatch"
+        },
+        "Transform": {
+          "position": [
+            -3.8772830963134766,
+            0.0,
+            5.5530571937561035
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 16843647069316479992
+    }
+  ],
+  "name": "Test Scene",
+  "version": 1
+}

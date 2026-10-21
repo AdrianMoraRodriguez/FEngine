@@ -8,18 +8,21 @@
 #include <vulkan/vulkan.h>
 #include <glm/glm.hpp>
 #include <array>
+#include <cstddef>
 
 namespace fe {
 
 /**
- * @brief A single mesh vertex with position and colour.
+ * @brief A single mesh vertex: position, normal and colour.
  *
  * The layout matches the vertex shader's `layout(location = N) in` inputs:
  *   - location 0: position (vec3)
- *   - location 1: color   (vec3)
+ *   - location 1: normal   (vec3)
+ *   - location 2: color    (vec3)
  */
 struct Vertex {
     glm::vec3 position; ///< Object-space position.
+    glm::vec3 normal;   ///< Object-space unit normal, used for lighting.
     glm::vec3 color;    ///< Linear RGB vertex colour.
 
     /**
@@ -41,21 +44,24 @@ struct Vertex {
      *
      * Maps each struct member to its shader location, format and byte offset.
      */
-    static std::array<VkVertexInputAttributeDescription, 2>
+    static std::array<VkVertexInputAttributeDescription, 3>
     attributeDescriptions() {
-        std::array<VkVertexInputAttributeDescription, 2> attrs{};
+        std::array<VkVertexInputAttributeDescription, 3> attrs{};
 
-        // location 0: position — three 32-bit floats
         attrs[0].binding  = 0;
         attrs[0].location = 0;
         attrs[0].format   = VK_FORMAT_R32G32B32_SFLOAT;
         attrs[0].offset   = offsetof(Vertex, position);
 
-        // location 1: color — three 32-bit floats
         attrs[1].binding  = 0;
         attrs[1].location = 1;
         attrs[1].format   = VK_FORMAT_R32G32B32_SFLOAT;
-        attrs[1].offset   = offsetof(Vertex, color);
+        attrs[1].offset   = offsetof(Vertex, normal);
+
+        attrs[2].binding  = 0;
+        attrs[2].location = 2;
+        attrs[2].format   = VK_FORMAT_R32G32B32_SFLOAT;
+        attrs[2].offset   = offsetof(Vertex, color);
 
         return attrs;
     }

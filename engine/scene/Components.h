@@ -42,6 +42,14 @@ namespace fe {
 using json         = nlohmann::json;
 using AssetHandle  = std::uint64_t;
 
+/// Reserved asset handles for the primitive meshes built into the engine.
+/// Temporary: a real asset manager will replace this.
+namespace builtin {
+constexpr AssetHandle MeshNone  = 0;
+constexpr AssetHandle MeshCube  = 1;
+constexpr AssetHandle MeshPlane = 2;
+} // namespace builtin
+
 // ---------------------------------------------------------------------------
 // Identity and hierarchy
 // ---------------------------------------------------------------------------
@@ -197,10 +205,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LightComponent, type, color, intensity, range
 // headers are not pulled into every translation unit that includes this file.
 // ---------------------------------------------------------------------------
 
-void inspect(NameComponent&);
-void inspect(Transform&);
-void inspect(MeshRenderer&);
-void inspect(CameraComponent&);
-void inspect(LightComponent&);
+bool inspect(NameComponent&);
+bool inspect(Transform&);
+bool inspect(MeshRenderer&);
+bool inspect(CameraComponent&);
+bool inspect(LightComponent&);
 
 } // namespace fe

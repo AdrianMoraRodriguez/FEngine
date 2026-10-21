@@ -17,7 +17,7 @@ namespace fe {
  * @brief A scene: a collection of entities with components.
  *
  * The scene owns an entt::registry and maintains a hierarchy of entities
- * through Relationship components. It also keeps a UUID → entity map for
+ * through Relationship components. It also keeps a UUID to entity map for
  * O(1) lookups by persistent identifier.
  *
  * Typical usage:
@@ -28,16 +28,21 @@ namespace fe {
  * scene.updateTransforms();
  * @endcode
  *
- * @note Scene is not copyable. Each scene owns its registry and all the
- *       entities within it.
+ * @note Scene is movable but not copyable. Moving lets the editor replace a
+ *       scene's contents while panels keep a reference to the same object.
  */
 class Scene {
 public:
-    Scene() = default;
+    Scene()  = default;
     ~Scene() = default;
 
     Scene(const Scene&)            = delete;
     Scene& operator=(const Scene&) = delete;
+
+    // Movable, so the editor can replace a scene's contents (New / Open) while
+    // panels keep their reference to the same Scene object.
+    Scene(Scene&&)            = default;
+    Scene& operator=(Scene&&) = default;
 
     /**
      * @brief Creates a new entity with IDComponent, NameComponent,
@@ -104,13 +109,28 @@ public:
     /**
      * @brief Returns the local transform of an entity and marks it dirty.
      *
-     * Use this accessor — rather than registry().get<Transform>() — when
+     * Use this accessor, rather than registry().get<Transform>(), when
      * modifying a transform so that WorldTransform is recomputed next frame.
      *
      * @param e A valid entity with a Transform component.
      * @return Reference to the mutable local transform.
      */
     Transform& transform(entt::entity e);
+
+    /**
+     * @brief Sets an entity's transform from a world-space matrix.
+     *
+     * Converts @p world into the entity's local space (relative to its
+     * parent's current world matrix) and stores it in the Transform
+     * component. Used by viewport gizmos, which manipulate world matrices.
+     *
+     * The parent's WorldTransform must be up to date, which holds as long as
+     * updateTransforms() runs once per frame.
+     *
+     * @param e     A valid entity.
+     * @param world The desired world-space matrix.
+     */
+    void setWorldMatrix(entt::entity e, const glm::mat4& world);
 
     /**
      * @brief Looks up an entity by its persistent UUID.
@@ -129,7 +149,7 @@ public:
     /// @return Const reference to the underlying EnTT registry.
     const entt::registry& registry() const { return m_registry; }
 
-    /// @return Display name of this scene (shown in the title bar).
+    /// @return Display name of this scene.
     const std::string& name() const { return m_name; }
 
     /// @brief Sets the display name of this scene.

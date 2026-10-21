@@ -4,14 +4,36 @@
 #include <vector>
 
 namespace fe {
+namespace {
+
+/// Splits an affine matrix into position, rotation and scale.
+///
+/// Shared by setParent() and setWorldMatrix(). Shear and mirroring are not
+/// representable by a Transform and are discarded.
+void decomposeInto(Transform& t, const glm::mat4& m) {
+    t.position = glm::vec3(m[3]);
+
+    const glm::vec3 sx{m[0]}, sy{m[1]}, sz{m[2]};
+    t.scale = { glm::length(sx), glm::length(sy), glm::length(sz) };
+
+    // A collapsed axis has no direction, so the rotation cannot be recovered.
+    // Keep the previous rotation instead of dividing by zero.
+    const float eps = 1e-6f;
+    if (t.scale.x > eps && t.scale.y > eps && t.scale.z > eps) {
+        const glm::mat3 rot{ sx / t.scale.x, sy / t.scale.y, sz / t.scale.z };
+        t.rotation = glm::quat_cast(rot);
+    }
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 void Scene::attach(entt::entity child, entt::entity parent) {
-    auto& rel   = m_registry.get<Relationship>(child);
-    rel.parent  = parent;
+    auto& rel  = m_registry.get<Relationship>(child);
+    rel.parent = parent;
 
     // Find the tail of the sibling chain and append.
     entt::entity head = (parent != entt::null)
@@ -115,32 +137,36 @@ void Scene::setParent(entt::entity child, entt::entity newParent,
 
     // Snapshot world transform before re-parenting.
     if (keepWorldTransform) updateTransforms();
-    glm::mat4 worldSnap = m_registry.get<WorldTransform>(child).matrix;
+    const glm::mat4 worldSnap = m_registry.get<WorldTransform>(child).matrix;
 
     detach(child);
     attach(child, newParent);
 
     if (keepWorldTransform) {
-        glm::mat4 parentWorld = (newParent != entt::null)
+        const glm::mat4 parentWorld = (newParent != entt::null)
             ? m_registry.get<WorldTransform>(newParent).matrix
             : glm::mat4(1.0f);
 
-        glm::mat4 localM = glm::inverse(parentWorld) * worldSnap;
-
-        auto& t = m_registry.get<Transform>(child);
-        t.position = glm::vec3(localM[3]);
-
-        glm::vec3 sx{localM[0]}, sy{localM[1]}, sz{localM[2]};
-        t.scale = { glm::length(sx), glm::length(sy), glm::length(sz) };
-
-        glm::mat3 rot{ sx / t.scale.x, sy / t.scale.y, sz / t.scale.z };
-        t.rotation = glm::quat_cast(rot);
+        decomposeInto(m_registry.get<Transform>(child),
+                      glm::inverse(parentWorld) * worldSnap);
     }
 }
 
 Transform& Scene::transform(entt::entity e) {
     m_registry.get<WorldTransform>(e).dirty = true;
     return m_registry.get<Transform>(e);
+}
+
+void Scene::setWorldMatrix(entt::entity e, const glm::mat4& world) {
+    const entt::entity parent = m_registry.get<Relationship>(e).parent;
+
+    const glm::mat4 parentWorld = (parent != entt::null)
+        ? m_registry.get<WorldTransform>(parent).matrix
+        : glm::mat4(1.0f);
+
+    // transform() flags the world matrix as stale, so it is rebuilt from
+    // the new local values on the next updateTransforms().
+    decomposeInto(transform(e), glm::inverse(parentWorld) * world);
 }
 
 void Scene::updateTransforms() {
@@ -151,7 +177,7 @@ void Scene::updateTransforms() {
 
 void Scene::updateRecursive(entt::entity e, const glm::mat4& parentWorld,
                              bool parentDirty) {
-    auto& wt        = m_registry.get<WorldTransform>(e);
+    auto& wt         = m_registry.get<WorldTransform>(e);
     const bool dirty = parentDirty || wt.dirty;
 
     if (dirty) {

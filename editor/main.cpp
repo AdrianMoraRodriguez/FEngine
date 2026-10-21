@@ -9,25 +9,32 @@
 #include "gfx/VulkanContext.h"
 #include "gfx/Renderer.h"
 #include "gfx/OffscreenBuffer.h"
+#include "gfx/SceneRenderer.h"
 #include "scene/Scene.h"
 #include "scene/ComponentRegistry.h"
 #include "scene/SceneSerializer.h"
 #include "editor/AssetBrowser.h"
+#include "editor/EditorCamera.h"
+#include "editor/SceneFileController.h"
 #include "editor/HierarchyPanel.h"
 #include "editor/InspectorPanel.h"
 #include "editor/ViewportPanel.h"
 #include "editor/StatisticsPanel.h"
-#include "gfx/MeshPipeline.h"
-#include "gfx/MeshBuffer.h"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
-#include <glm/gtc/matrix_transform.hpp>
-#include <windows.h>
+#include <exception>
+#include <cstdlib>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+
+// Windows header last, with the min/max macros disabled so they do not
+// break std::min / std::max in other headers.
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 namespace {
 
@@ -126,7 +133,7 @@ void shutdownImGui(VkDevice device) {
 // Dockspace
 // ---------------------------------------------------------------------------
 
-void beginDockspace(bool& running) {
+void beginDockspace(bool& running, fe::SceneFileController& sceneFiles) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -153,21 +160,33 @@ void beginDockspace(bool& running) {
 
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("File")) {
+            sceneFiles.drawMenuItems();
+            ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) running = false;
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem("Hierarchy",     nullptr, nullptr);
-            ImGui::MenuItem("Inspector",     nullptr, nullptr);
-            ImGui::MenuItem("Viewport",      nullptr, nullptr);
-            ImGui::MenuItem("Statistics",    nullptr, nullptr);
-            ImGui::MenuItem("Asset Browser", nullptr, nullptr);
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
     }
 
     ImGui::End();
+}
+
+/// Creates a named entity with a built-in mesh at the given transform.
+entt::entity addMeshEntity(fe::Scene& scene,
+                           const char* name,
+                           fe::AssetHandle mesh,
+                           const glm::vec3& position,
+                           const glm::vec3& scale) {
+    entt::entity e = scene.create(name);
+
+    fe::MeshRenderer renderer;
+    renderer.mesh = mesh;
+    scene.registry().emplace<fe::MeshRenderer>(e, renderer);
+
+    fe::Transform& t = scene.transform(e);
+    t.position = position;
+    t.scale    = scale;
+    return e;
 }
 
 } // namespace
@@ -177,12 +196,28 @@ void beginDockspace(bool& running) {
 // ---------------------------------------------------------------------------
 
 int main() {
-    // Resolve paths relative to the executable, not the working directory.
+        // If an exception ever escapes, say what it was before the program dies.
+    // Without this, the only trace is a bare "abort() has been called".
+    std::set_terminate([] {
+        if (std::exception_ptr error = std::current_exception()) {
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception& e) {
+                FE_ERROR("Unhandled exception: %s", e.what());
+            } catch (...) {
+                FE_ERROR("Unhandled exception of unknown type");
+            }
+        }
+        std::abort();
+    });
+    // Resolve shader paths relative to the executable, not the working
+    // directory. Assets stay relative to the working directory because they
+    // belong to the project, not to the editor binary.
     char exePathBuf[MAX_PATH];
     GetModuleFileNameA(nullptr, exePathBuf, MAX_PATH);
-    std::filesystem::path exeDir = std::filesystem::path(exePathBuf).parent_path();
-    std::filesystem::path shaderDir  = exeDir / "shaders";
-    std::filesystem::path assetsDir  = std::filesystem::current_path() / "assets";
+    const std::filesystem::path exeDir    = std::filesystem::path(exePathBuf).parent_path();
+    const std::filesystem::path shaderDir = exeDir / "shaders";
+    const std::filesystem::path assetsDir = std::filesystem::current_path() / "assets";
 
     FE_INFO("%s", fe::engineVersionString());
 
@@ -200,75 +235,51 @@ int main() {
     fe::OffscreenBuffer offscreen;
     if (!offscreen.init(vkCtx, 1280, 720)) return 1;
 
-    // Test mesh — a coloured cube.
-    const std::vector<fe::Vertex> cubeVertices = {
-        // Front face
-        {{-0.5f, -0.5f,  0.5f}, {1.0f, 0.0f, 0.0f}},
-        {{ 0.5f, -0.5f,  0.5f}, {0.0f, 1.0f, 0.0f}},
-        {{ 0.5f,  0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}},
-        {{-0.5f,  0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}},
-        // Back face
-        {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 1.0f}},
-        {{ 0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 1.0f}},
-        {{ 0.5f,  0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}},
-        {{-0.5f,  0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}},
-    };
-
-    const std::vector<uint32_t> cubeIndices = {
-        0,1,2, 2,3,0,  // front
-        4,6,5, 6,4,7,  // back
-        4,5,1, 1,0,4,  // bottom
-        3,2,6, 6,7,3,  // top
-        1,5,6, 6,2,1,  // right
-        4,0,3, 3,7,4,  // left
-    };
-
-    fe::MeshBuffer cubeMesh;
-    if (!cubeMesh.upload(vkCtx, cubeVertices, cubeIndices)) return 1;
-
-    fe::MeshPipeline meshPipeline;
-    if (!meshPipeline.init(vkCtx, fe::OffscreenBuffer::format(),
-                       shaderDir.string().c_str())) return 1;
-
+    fe::SceneRenderer sceneRenderer;
+    if (!sceneRenderer.init(vkCtx, shaderDir.string().c_str())) return 1;
+    sceneRenderer.meshes().setAssetRoot(assetsDir);
+    sceneRenderer.meshes().scanAssets();
 
     fe::registerBuiltinComponents();
 
-    // Test scene.
-    fe::Scene        scene;
-    entt::entity     selectedEntity = entt::null;
+    // ---- Starting scene ----
+    fe::Scene    scene;
+    entt::entity selectedEntity = entt::null;
     scene.setName("Test Scene");
     {
-        entt::entity root   = scene.create("Root");
-        entt::entity child  = scene.create("Child", root);
-        entt::entity camera = scene.create("Camera", root);
-        (void)child;
+        addMeshEntity(scene, "Ground", fe::builtin::MeshPlane,
+                      {0.0f, 0.0f, 0.0f}, {10.0f, 1.0f, 10.0f});
+        addMeshEntity(scene, "Cube", fe::builtin::MeshCube,
+                      {0.0f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f});
+        addMeshEntity(scene, "Small Cube", fe::builtin::MeshCube,
+                      {1.2f, 0.3f, 0.6f}, {0.6f, 0.6f, 0.6f});
+
+        entt::entity camera = scene.create("Camera");
         scene.registry().emplace<fe::CameraComponent>(camera);
         scene.transform(camera).position = {0.0f, 5.0f, 10.0f};
-        scene.updateTransforms();
 
-        fe::SceneSerializer::saveToFile(scene, "test_scene.fescene");
-        fe::Scene loaded;
-        fe::SceneSerializer::loadFromFile(loaded, "test_scene.fescene");
-        FE_INFO("Round-trip OK: '%s' with %zu entities",
-                loaded.name().c_str(),
-                loaded.registry().storage<entt::entity>().size());
+        scene.updateTransforms();
     }
 
-    // Frame timing — declared before panels so StatisticsPanel can
-    // hold const references to them.
+    // Frame timing: declared before the panels because StatisticsPanel
+    // keeps references to these variables.
     uint64_t frameCount = 0;
     double   lastTime   = 0.0;
     double   deltaTime  = 0.0;
 
-    // Panels — each owns references to its dependencies.
-    // Construction order does not matter; all dependencies are already alive.
+    fe::EditorCamera editorCamera;
+
     fe::HierarchyPanel  hierarchyPanel {scene, selectedEntity};
     fe::InspectorPanel  inspectorPanel {scene, selectedEntity};
-    fe::ViewportPanel   viewportPanel  {offscreen};
+    fe::ViewportPanel   viewportPanel  {offscreen, editorCamera, scene, selectedEntity, sceneRenderer};
     fe::StatisticsPanel statisticsPanel{scene, renderer, deltaTime, frameCount};
-    fe::AssetBrowser assetBrowser{assetsDir};
+    fe::AssetBrowser    assetBrowser   {assetsDir};
 
-    // Uniform panel array — adding a new panel is one line here.
+    // New / Open / Save. The starting scene counts as saved, so replacing it
+    // right away does not ask for confirmation.
+    fe::SceneFileController sceneFiles{scene, selectedEntity, assetsDir / "scenes"};
+    sceneFiles.markClean();
+
     fe::Panel* panels[] = {
         &hierarchyPanel,
         &inspectorPanel,
@@ -292,71 +303,53 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        beginDockspace(running);
+        beginDockspace(running, sceneFiles);
 
         for (auto* panel : panels)
             panel->onImGui();
 
-        ImGui::Render();   // all panels must be submitted before this
+        sceneFiles.onImGui();   // shortcuts and the Open / Save / Discard dialogs
+
+        ImGui::Render();
+
+        // Panels may have created, deleted or edited entities this frame, so
+        // refresh the world matrices before drawing.
+        scene.updateTransforms();
+
+        // Upload any model the scene uses for the first time. It has to happen
+        // here, before recording the frame, because loading submits its own GPU work.
+        sceneRenderer.prepare(scene);
 
         // ----- GPU frame -----
         if (!renderer.beginFrame()) continue;
 
-        // 1. Offscreen pass — scene geometry (placeholder clear for now).
-        fe::Renderer::beginOffscreenPass(
-            renderer.currentCommandBuffer(),
-            offscreen.image(),
-            offscreen.imageView(),
-            {offscreen.width(), offscreen.height()});
+        VkCommandBuffer cmd = renderer.currentCommandBuffer();
 
-        // Set viewport and scissor dynamically.
-        VkViewport vp{};
-        vp.width    = static_cast<float>(offscreen.width());
-        vp.height   = static_cast<float>(offscreen.height());
-        vp.minDepth = 0.0f;
-        vp.maxDepth = 1.0f;
-        vkCmdSetViewport(renderer.currentCommandBuffer(), 0, 1, &vp);
+        // 1. Scene pass: draw the scene into the offscreen buffer.
+        fe::Renderer::beginOffscreenPass(cmd, offscreen);
 
-        VkRect2D scissor{};
-        scissor.extent = {offscreen.width(), offscreen.height()};
-        vkCmdSetScissor(renderer.currentCommandBuffer(), 0, 1, &scissor);
+        const float aspect = static_cast<float>(offscreen.width()) /
+                             static_cast<float>(offscreen.height());
+        const glm::mat4 viewProj = editorCamera.projection(aspect) * editorCamera.view();
 
-        // Rotate the cube over time.
-        float angle = static_cast<float>(glfwGetTime());
-        glm::mat4 model = glm::rotate(glm::mat4(1.0f), angle,
-                                       glm::vec3(0.5f, 1.0f, 0.0f));
-        glm::mat4 view  = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f),
-                                       glm::vec3(0.0f, 0.0f, 0.0f),
-                                       glm::vec3(0.0f, 1.0f, 0.0f));
-        glm::mat4 proj  = glm::perspective(
-            glm::radians(60.0f),
-            static_cast<float>(offscreen.width()) /
-            static_cast<float>(offscreen.height()),
-            0.1f, 100.0f);
+        sceneRenderer.render(cmd, scene, viewProj,
+                             {offscreen.width(), offscreen.height()});
 
-        fe::MeshPushConstants pc;
-        pc.mvp = proj * view * model;
+        fe::Renderer::endOffscreenPass(cmd, offscreen);
 
-        meshPipeline.bind(renderer.currentCommandBuffer(), pc);
-        cubeMesh.draw(renderer.currentCommandBuffer());
-
-        fe::Renderer::endOffscreenPass(
-            renderer.currentCommandBuffer(),
-            offscreen.image());
-
-        // 2. Swapchain pass — ImGui on top of the offscreen image.
+        // 2. Swapchain pass: ImGui on top (the Viewport panel samples the
+        //    offscreen colour image).
         renderer.beginSwapchainPass();
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
-                                        renderer.currentCommandBuffer());
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
         renderer.endSwapchainPass();
 
         renderer.endFrame();
     }
 
     FE_INFO("Shutting down");
-    cubeMesh.destroy();
-    meshPipeline.shutdown();
     vkDeviceWaitIdle(vkCtx.device());
+
+    sceneRenderer.shutdown();
     offscreen.shutdown();
     shutdownImGui(vkCtx.device());
     renderer.shutdown();

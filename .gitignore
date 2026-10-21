@@ -83,3 +83,16 @@ captures/
 docs/html/
 docs/xml/
 docs/latex/
+
+# Downloaded sample models: each ships its own licence, so they are not
+# redistributed through this repository.
+assets/meshes/*.glb
+assets/meshes/*.gltf
+assets/meshes/*.bin
+assets/meshes/*.fbx
+assets/meshes/*.obj
+assets/meshes/*.mtl
+assets/meshes/*.dae
+assets/meshes/*.3ds
+assets/meshes/*.stl
+assets/meshes/*.ply

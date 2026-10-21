@@ -34,8 +34,11 @@ bool OffscreenBuffer::create(uint32_t width, uint32_t height) {
     m_width  = width;
     m_height = height;
 
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
     // ------------------------------------------------------------------
-    // 1. Image
+    // 1. Colour image (rendered into, then sampled by ImGui)
     // ------------------------------------------------------------------
     VkImageCreateInfo imageInfo{};
     imageInfo.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -46,50 +49,66 @@ bool OffscreenBuffer::create(uint32_t width, uint32_t height) {
     imageInfo.arrayLayers   = 1;
     imageInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    // COLOR_ATTACHMENT: rendered into. SAMPLED: read by ImGui shader.
     imageInfo.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                             | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VmaAllocationCreateInfo allocInfo{};
-    // GPU_ONLY: fastest memory, not CPU-accessible. Appropriate for a
-    // render target that the CPU never reads back.
-    allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-
     if (vmaCreateImage(m_ctx->allocator(), &imageInfo, &allocInfo,
                        &m_image, &m_allocation, nullptr) != VK_SUCCESS) {
-        FE_ERROR("OffscreenBuffer: failed to create image (%ux%u)", width, height);
+        FE_ERROR("OffscreenBuffer: failed to create colour image (%ux%u)",
+                 width, height);
         return false;
     }
 
-    // ------------------------------------------------------------------
-    // 2. Image view
-    // ------------------------------------------------------------------
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image                           = m_image;
     viewInfo.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format                          = format();
     viewInfo.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewInfo.subresourceRange.baseMipLevel   = 0;
     viewInfo.subresourceRange.levelCount     = 1;
-    viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount     = 1;
 
     if (vkCreateImageView(m_ctx->device(), &viewInfo, nullptr,
                           &m_imageView) != VK_SUCCESS) {
-        FE_ERROR("OffscreenBuffer: failed to create image view");
+        FE_ERROR("OffscreenBuffer: failed to create colour image view");
         return false;
     }
 
     // ------------------------------------------------------------------
-    // 3. Sampler
+    // 2. Depth image (only used during the scene pass, never sampled)
+    // ------------------------------------------------------------------
+    VkImageCreateInfo depthInfo = imageInfo;
+    depthInfo.format = depthFormat();
+    depthInfo.usage  = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+
+    if (vmaCreateImage(m_ctx->allocator(), &depthInfo, &allocInfo,
+                       &m_depthImage, &m_depthAllocation,
+                       nullptr) != VK_SUCCESS) {
+        FE_ERROR("OffscreenBuffer: failed to create depth image (%ux%u)",
+                 width, height);
+        return false;
+    }
+
+    VkImageViewCreateInfo depthViewInfo = viewInfo;
+    depthViewInfo.image                       = m_depthImage;
+    depthViewInfo.format                      = depthFormat();
+    depthViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+
+    if (vkCreateImageView(m_ctx->device(), &depthViewInfo, nullptr,
+                          &m_depthView) != VK_SUCCESS) {
+        FE_ERROR("OffscreenBuffer: failed to create depth image view");
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Sampler + ImGui descriptor set (colour image only)
     // ------------------------------------------------------------------
     VkSamplerCreateInfo samplerInfo{};
-    samplerInfo.sType      = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    samplerInfo.magFilter  = VK_FILTER_LINEAR;
-    samplerInfo.minFilter  = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter    = VK_FILTER_LINEAR;
+    samplerInfo.minFilter    = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -101,24 +120,15 @@ bool OffscreenBuffer::create(uint32_t width, uint32_t height) {
         return false;
     }
 
-    // ------------------------------------------------------------------
-    // 4. ImGui descriptor set
-    //
-    // ImGui_ImplVulkan_AddTexture creates a VkDescriptorSet that binds
-    // the sampler + image view. Passing this set to ImGui::Image() tells
-    // ImGui to sample our offscreen image when drawing the Viewport panel.
-    // ------------------------------------------------------------------
     m_imguiDescSet = ImGui_ImplVulkan_AddTexture(
-        m_sampler,
-        m_imageView,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        m_sampler, m_imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     if (!m_imguiDescSet) {
         FE_ERROR("OffscreenBuffer: ImGui_ImplVulkan_AddTexture failed");
         return false;
     }
 
-    FE_INFO("OffscreenBuffer created: %ux%u", width, height);
+    FE_INFO("OffscreenBuffer created: %ux%u (colour + depth)", width, height);
     return true;
 }
 
@@ -141,6 +151,15 @@ void OffscreenBuffer::destroy() {
         vmaDestroyImage(m_ctx->allocator(), m_image, m_allocation);
         m_image      = VK_NULL_HANDLE;
         m_allocation = VK_NULL_HANDLE;
+    }
+    if (m_depthView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_ctx->device(), m_depthView, nullptr);
+        m_depthView = VK_NULL_HANDLE;
+    }
+    if (m_depthImage != VK_NULL_HANDLE) {
+        vmaDestroyImage(m_ctx->allocator(), m_depthImage, m_depthAllocation);
+        m_depthImage      = VK_NULL_HANDLE;
+        m_depthAllocation = VK_NULL_HANDLE;
     }
 }
 

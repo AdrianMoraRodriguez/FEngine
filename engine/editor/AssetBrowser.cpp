@@ -1,16 +1,24 @@
 #include "editor/AssetBrowser.h"
-#include "editor/Panel.h"
+
 #include "core/Log.h"
+#include "core/PathUtil.h"
+#include "import/ModelImporter.h"
 
 #include <imgui.h>
+
 #include <algorithm>
+#include <cctype>
+#include <string>
 
 namespace fe {
 namespace {
 
-/// Returns true if @p ext is a recognised mesh format.
-bool isMesh(const std::string& ext) {
-    return ext == ".gltf" || ext == ".glb" || ext == ".obj" || ext == ".fbx";
+/// @return The extension of @p path in lower case, including the dot.
+std::string lowerExtension(const std::filesystem::path& path) {
+    std::string ext = toUtf8(path.extension());
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext;
 }
 
 /// Returns true if @p ext is a recognised image format.
@@ -22,6 +30,19 @@ bool isTexture(const std::string& ext) {
 /// Returns true if @p ext is a recognised scene file.
 bool isScene(const std::string& ext) {
     return ext == ".fescene";
+}
+
+/// Shortens UTF-8 text to at most @p maxBytes bytes, adding an ellipsis.
+/// Never cuts in the middle of a multi-byte character, which would leave
+/// invalid text behind.
+std::string shorten(const std::string& text, size_t maxBytes) {
+    if (text.size() <= maxBytes) return text;
+
+    size_t cut = maxBytes - 1;   // room for the ellipsis
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80)
+        --cut;                   // step back to the start of a character
+
+    return text.substr(0, cut) + "…";
 }
 
 } // namespace
@@ -38,23 +59,28 @@ void AssetBrowser::refresh() {
     std::error_code ec;
     if (!std::filesystem::exists(m_currentDir, ec)) {
         FE_WARN("AssetBrowser: directory does not exist: %s",
-                m_currentDir.string().c_str());
+                toUtf8(m_currentDir).c_str());
         m_currentDir = m_root;
         return;
     }
 
-    for (const auto& entry :
-         std::filesystem::directory_iterator(m_currentDir, ec)) {
-        if (ec) break;
+    // Advanced with increment(ec): the range-for operator++ throws when one
+    // entry cannot be read, and one odd file must not be able to crash the
+    // editor.
+    const std::filesystem::directory_iterator end;
+    for (std::filesystem::directory_iterator it(m_currentDir, ec);
+         !ec && it != end; it.increment(ec)) {
 
         // Skip hidden files (starting with '.') like .gitkeep.
-        const std::string filename = entry.path().filename().string();
+        const std::string filename = toUtf8(it->path().filename());
         if (!filename.empty() && filename[0] == '.') continue;
 
+        std::error_code typeEc;
+
         AssetEntry ae;
-        ae.path  = entry.path();
+        ae.path  = it->path();
         ae.name  = filename;
-        ae.isDir = entry.is_directory(ec);
+        ae.isDir = it->is_directory(typeEc);
         m_entries.push_back(std::move(ae));
     }
 
@@ -68,9 +94,9 @@ void AssetBrowser::refresh() {
 
 const char* AssetBrowser::iconFor(const AssetEntry& entry) {
     if (entry.isDir) return "📁";
+    if (isSupportedModel(entry.path)) return "🗿";
 
-    const std::string ext = entry.path.extension().string();
-    if (isMesh(ext))    return "🗿";
+    const std::string ext = lowerExtension(entry.path);
     if (isTexture(ext)) return "🖼";
     if (isScene(ext))   return "🎬";
     return "📄";
@@ -78,7 +104,7 @@ const char* AssetBrowser::iconFor(const AssetEntry& entry) {
 
 void AssetBrowser::drawFolderTree(const std::filesystem::path& dir) {
     std::error_code ec;
-    const std::string label = dir.filename().string();
+    const std::string label = toUtf8(dir.filename());
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow
                              | ImGuiTreeNodeFlags_SpanAvailWidth;
@@ -86,9 +112,11 @@ void AssetBrowser::drawFolderTree(const std::filesystem::path& dir) {
         flags |= ImGuiTreeNodeFlags_Selected;
 
     // Check whether this directory has any subdirectories to show the arrow.
+    const std::filesystem::directory_iterator end;
     bool hasSubdirs = false;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-        if (e.is_directory(ec)) { hasSubdirs = true; break; }
+    for (std::filesystem::directory_iterator it(dir, ec); !ec && it != end; it.increment(ec)) {
+        std::error_code typeEc;
+        if (it->is_directory(typeEc)) { hasSubdirs = true; break; }
     }
     if (!hasSubdirs) flags |= ImGuiTreeNodeFlags_Leaf;
 
@@ -101,12 +129,13 @@ void AssetBrowser::drawFolderTree(const std::filesystem::path& dir) {
     }
 
     if (open) {
-        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-            if (e.is_directory(ec)) {
-                const std::string name = e.path().filename().string();
-                if (!name.empty() && name[0] != '.')
-                    drawFolderTree(e.path());
-            }
+        for (std::filesystem::directory_iterator it(dir, ec); !ec && it != end; it.increment(ec)) {
+            std::error_code typeEc;
+            if (!it->is_directory(typeEc)) continue;
+
+            const std::string name = toUtf8(it->path().filename());
+            if (!name.empty() && name[0] != '.')
+                drawFolderTree(it->path());
         }
         ImGui::TreePop();
     }
@@ -117,7 +146,7 @@ void AssetBrowser::drawEntry(const AssetEntry& entry) {
     const char* icon      = iconFor(entry);
 
     // Each entry is a selectable square tile.
-    ImGui::PushID(entry.path.string().c_str());
+    ImGui::PushID(toUtf8(entry.path).c_str());
 
     const float tileSize = 72.0f;
     ImVec2 cursor = ImGui::GetCursorScreenPos();
@@ -125,13 +154,22 @@ void AssetBrowser::drawEntry(const AssetEntry& entry) {
     if (ImGui::Selectable("##tile", isSelected,
                           ImGuiSelectableFlags_None,
                           ImVec2(tileSize, tileSize + 20.0f))) {
-        if (entry.isDir) {
-            m_currentDir = entry.path;
-            m_selected   = std::filesystem::path{};
-            refresh();
-        } else {
+        if (entry.isDir)
+            m_pendingDir = entry.path;   // navigate after drawing, see onImGui
+        else
             m_selected = entry.path;
-        }
+    }
+
+    // Models can be dragged into the viewport to add them to the scene.
+    // The drag source belongs to the last item drawn, so this must stay
+    // right after the Selectable.
+    if (!entry.isDir && isSupportedModel(entry.path) &&
+        ImGui::BeginDragDropSource()) {
+        // Sent as UTF-8 so the path survives any character in it.
+        const std::u8string path = entry.path.u8string();
+        ImGui::SetDragDropPayload("FE_MODEL", path.c_str(), path.size() + 1);
+        ImGui::TextUnformatted(entry.name.c_str());   // what follows the cursor
+        ImGui::EndDragDropSource();
     }
 
     // Draw icon and label on top of the selectable.
@@ -140,11 +178,7 @@ void AssetBrowser::drawEntry(const AssetEntry& entry) {
     draw->AddText(ImGui::GetFont(), 28.0f, iconPos,
                   IM_COL32(220, 220, 220, 255), icon);
 
-    // Truncate long names with ellipsis.
-    std::string displayName = entry.name;
-    if (displayName.size() > 10)
-        displayName = displayName.substr(0, 9) + "…";
-
+    const std::string displayName = shorten(entry.name, 10);
     const ImVec2 textPos = {cursor.x + 4.0f, cursor.y + tileSize - 4.0f};
     draw->AddText(textPos, IM_COL32(200, 200, 200, 255), displayName.c_str());
 
@@ -157,26 +191,30 @@ void AssetBrowser::onImGui() {
     // ---- Breadcrumb bar ----
     // Show the path relative to root and allow clicking any segment.
     {
-        std::filesystem::path rel = std::filesystem::relative(m_currentDir, m_root);
-        std::string crumb = "assets";
-        if (ImGui::SmallButton(crumb.c_str())) {
+        std::error_code ec;
+        const std::filesystem::path rel =
+            std::filesystem::relative(m_currentDir, m_root, ec);
+
+        if (ImGui::SmallButton("assets")) {
             m_currentDir = m_root;
             m_selected   = std::filesystem::path{};
             refresh();
         }
 
-        std::filesystem::path accumulated = m_root;
-        for (const auto& part : rel) {
-            if (part == ".") continue;
-            accumulated /= part;
-            ImGui::SameLine(0, 2);
-            ImGui::TextUnformatted("/");
-            ImGui::SameLine(0, 2);
-            const std::string partStr = part.string();
-            if (ImGui::SmallButton(partStr.c_str())) {
-                m_currentDir = accumulated;
-                m_selected   = std::filesystem::path{};
-                refresh();
+        if (!ec) {
+            std::filesystem::path accumulated = m_root;
+            for (const auto& part : rel) {
+                if (part == ".") continue;
+                accumulated /= part;
+                ImGui::SameLine(0, 2);
+                ImGui::TextUnformatted("/");
+                ImGui::SameLine(0, 2);
+                const std::string partText = toUtf8(part);
+                if (ImGui::SmallButton(partText.c_str())) {
+                    m_currentDir = accumulated;
+                    m_selected   = std::filesystem::path{};
+                    refresh();
+                }
             }
         }
 
@@ -231,10 +269,21 @@ void AssetBrowser::onImGui() {
     // ---- Status bar ----
     ImGui::Separator();
     if (!m_selected.empty()) {
-        ImGui::TextDisabled("%s",
-            std::filesystem::relative(m_selected, m_root).string().c_str());
+        std::error_code ec;
+        const std::filesystem::path shown =
+            std::filesystem::relative(m_selected, m_root, ec);
+        ImGui::TextDisabled("%s", toUtf8(ec ? m_selected : shown).c_str());
     } else {
         ImGui::TextDisabled("%zu items", m_entries.size());
+    }
+
+    // Apply navigation requested while drawing. By now no reference into
+    // m_entries is alive, so rebuilding the list is safe.
+    if (!m_pendingDir.empty()) {
+        m_currentDir = std::move(m_pendingDir);
+        m_pendingDir = std::filesystem::path{};
+        m_selected   = std::filesystem::path{};
+        refresh();
     }
 
     ImGui::End();

@@ -1,0 +1,38 @@
+{
+  "entities": [
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 1
+        },
+        "Name": {
+          "name": "Cube"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            4.329999923706055,
+            4.329999923706055,
+            4.329999923706055
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 989388699105104754
+    }
+  ],
+  "name": "Prueba",
+  "version": 1
+}

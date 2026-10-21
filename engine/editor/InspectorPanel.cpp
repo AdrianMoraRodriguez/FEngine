@@ -1,5 +1,7 @@
 #include "editor/InspectorPanel.h"
+
 #include "scene/ComponentRegistry.h"
+
 #include <imgui.h>
 
 namespace fe {
@@ -14,6 +16,7 @@ void InspectorPanel::onImGui() {
         return;
     }
 
+    // Editable name + UUID. A rename cannot affect any derived data.
     auto& name = m_scene.registry().get<NameComponent>(m_selected);
     inspect(name);
     ImGui::SameLine();
@@ -22,14 +25,16 @@ void InspectorPanel::onImGui() {
 
     ImGui::Separator();
 
+    // One collapsing section per registered component.
+    bool changed = false;
     for (const auto& meta : ComponentRegistry::instance().all()) {
         if (meta.name == "Name") continue;
         if (!meta.has(m_scene.registry(), m_selected)) continue;
 
         ImGui::PushID(meta.name.c_str());
 
-        bool open = ImGui::CollapsingHeader(meta.name.c_str(),
-                        ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader(meta.name.c_str(),
+                              ImGuiTreeNodeFlags_DefaultOpen);
 
         if (meta.removable) {
             ImGui::SameLine(ImGui::GetContentRegionAvail().x
@@ -39,10 +44,17 @@ void InspectorPanel::onImGui() {
         }
 
         if (open)
-            meta.inspect(m_scene.registry(), m_selected);
+            changed |= meta.inspect(m_scene.registry(), m_selected);
 
         ImGui::PopID();
     }
+
+    // The inspector edits components straight through the registry, which
+    // does not flag the cached world matrix as stale. Do it only when a
+    // widget reported an actual edit; Scene::updateTransforms() then
+    // recomputes this entity and its children, and nothing else.
+    if (changed)
+        m_scene.registry().get<WorldTransform>(m_selected).dirty = true;
 
     ImGui::Separator();
 
