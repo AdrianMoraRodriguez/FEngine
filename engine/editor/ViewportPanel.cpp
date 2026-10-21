@@ -6,6 +6,7 @@
 #include <imgui.h>
 #include <ImGuizmo.h>
 
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
 #include <algorithm>
@@ -66,6 +67,74 @@ void drawWorldLine(ImDrawList* draw,
     draw->AddLine(toScreen(ca), toScreen(cb), color, thickness);
 }
 
+// ---------------------------------------------------------------------------
+// Light gizmos
+// ---------------------------------------------------------------------------
+
+// The combo in the light inspector maps its index straight to the enum, and
+// the gizmo code below relies on the same order.
+static_assert(static_cast<int>(LightComponent::Type::Directional) == 0,
+              "Light gizmos assume the order Directional, Point, Spot");
+constexpr int kLightDirectional = 0;
+constexpr int kLightPoint       = 1;
+constexpr int kLightSpot        = 2;
+
+constexpr float kLightIconRadius   = 0.25f;  // size of the little symbol, world units
+constexpr float kLightPickHalfSize = 0.3f;   // half size of the box that selects a light
+constexpr float kMaxDrawnRange     = 200.0f; // keeps an absurd range from drawing a huge sphere
+constexpr float kMaxConeRadius     = 6.0f;   // widest circle drawn at the end of a spot cone
+
+/// Copy of @p m with the scale removed from its three axes. Gizmos keep the
+/// same size however much the entity is scaled.
+glm::mat4 withoutScale(const glm::mat4& m) {
+    glm::mat4 result = m;
+    for (int i = 0; i < 3; ++i) {
+        const float length = glm::length(glm::vec3(m[i]));
+        if (length > 1e-6f)
+            result[i] = glm::vec4(glm::vec3(m[i]) / length, 0.0f);
+    }
+    return result;
+}
+
+/// Colour of a light's gizmo: the light's own colour (never too dark to see),
+/// or orange when the light is selected, like the camera gizmos.
+ImU32 lightGizmoColor(const glm::vec3& lightColor, bool selected, int alpha = 255) {
+    if (selected) return IM_COL32(255, 170, 40, alpha);
+
+    const glm::vec3 c = glm::clamp(glm::max(lightColor, glm::vec3(0.35f)),
+                                   glm::vec3(0.0f), glm::vec3(1.0f));
+    return IM_COL32(static_cast<int>(c.x * 255.0f),
+                    static_cast<int>(c.y * 255.0f),
+                    static_cast<int>(c.z * 255.0f), alpha);
+}
+
+/// Draws lines in the local space of a model matrix, inside the viewport rectangle.
+struct GizmoPen {
+    ImDrawList*      draw;
+    const glm::mat4& viewProj;
+    glm::mat4        model;
+    float x, y, width, height;   ///< The viewport image rectangle on screen.
+    ImU32            color;
+    float            thickness;
+
+    void line(const glm::vec3& a, const glm::vec3& b) const {
+        drawWorldLine(draw, viewProj, model, a, b, x, y, width, height, color, thickness);
+    }
+
+    /// A circle in the plane spanned by the unit vectors @p u and @p v.
+    void circle(const glm::vec3& center, const glm::vec3& u, const glm::vec3& v,
+                float radius) const {
+        constexpr int kSegments = 24;
+        glm::vec3 previous = center + u * radius;
+        for (int i = 1; i <= kSegments; ++i) {
+            const float angle = glm::two_pi<float>() * static_cast<float>(i) / kSegments;
+            const glm::vec3 point = center + (u * std::cos(angle) + v * std::sin(angle)) * radius;
+            line(previous, point);
+            previous = point;
+        }
+    }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -120,6 +189,7 @@ void ViewportPanel::onImGui() {
     handleShortcuts();
 
     drawCameraGizmos(imageMin.x, imageMin.y, imageSize.x, imageSize.y);
+    drawLightGizmos(imageMin.x, imageMin.y, imageSize.x, imageSize.y);
     const bool gizmoActive =
         drawGizmo(imageMin.x, imageMin.y, imageSize.x, imageSize.y);
     drawToolbar(imageMin.x + 8.0f, imageMin.y + 8.0f);
@@ -291,6 +361,125 @@ void ViewportPanel::drawCameraGizmos(float x, float y, float width, float height
     draw->PopClipRect();
 }
 
+void ViewportPanel::drawLightGizmos(float x, float y, float width, float height) {
+    if (width <= 0.0f || height <= 0.0f) return;
+
+    const glm::mat4 viewProj =
+        m_camera.gizmoProjection(width / height) * m_camera.view();
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->PushClipRect(ImVec2(x, y), ImVec2(x + width, y + height), true);
+
+    const glm::vec3 axisX{1.0f, 0.0f, 0.0f};
+    const glm::vec3 axisY{0.0f, 1.0f, 0.0f};
+    const glm::vec3 axisZ{0.0f, 0.0f, 1.0f};
+    const glm::vec3 origin{0.0f};
+    const float     r = kLightIconRadius;
+
+    auto lights = m_scene.registry().view<const LightComponent, const WorldTransform>();
+    for (auto [entity, light, world] : lights.each()) {
+        const bool      selected = (entity == m_selected);
+        const glm::vec3 tint     = glm::vec3(light.color);
+        const float     thick    = selected ? 2.0f : 1.5f;
+        const int       type     = static_cast<int>(light.type);
+
+        // A light shines along its local -Z axis (like a camera looks), so the
+        // directional and spot shapes follow the entity's rotation. A point
+        // light shines everywhere, so it only needs the position.
+        glm::mat4 model = withoutScale(world.matrix);
+        if (type == kLightPoint) {
+            model    = glm::mat4(1.0f);
+            model[3] = world.matrix[3];
+        }
+
+        const GizmoPen pen{draw, viewProj, model, x, y, width, height,
+                           lightGizmoColor(tint, selected), thick};
+        const char* label = "Light";
+
+        if (type == kLightDirectional) {
+            label = "Directional light";
+
+            // A disc (the sun), parallel rays leaving it, and one arrow
+            // along the direction the light travels.
+            pen.circle(origin, axisX, axisY, r);
+
+            const float rayLength = 1.2f;
+            for (int i = 0; i < 4; ++i) {
+                const float angle = glm::half_pi<float>() * static_cast<float>(i);
+                const glm::vec3 start(std::cos(angle) * r, std::sin(angle) * r, 0.0f);
+                pen.line(start, start - axisZ * rayLength);
+            }
+
+            const float length = 1.8f, head = 0.12f, back = 0.3f;
+            pen.line(origin, -axisZ * length);
+            pen.line(-axisZ * length, glm::vec3( head, 0.0f, -length + back));
+            pen.line(-axisZ * length, glm::vec3(-head, 0.0f, -length + back));
+            pen.line(-axisZ * length, glm::vec3(0.0f,  head, -length + back));
+            pen.line(-axisZ * length, glm::vec3(0.0f, -head, -length + back));
+
+        } else if (type == kLightPoint) {
+            label = "Point light";
+
+            // Three small crossed circles: a bulb.
+            pen.circle(origin, axisX, axisY, r);
+            pen.circle(origin, axisX, axisZ, r);
+            pen.circle(origin, axisY, axisZ, r);
+
+            // The area it lights is only drawn for the selected light, so a
+            // scene full of lights does not turn into a tangle of spheres.
+            if (selected) {
+                const GizmoPen rangePen{draw, viewProj, model, x, y, width, height,
+                                        lightGizmoColor(tint, true, 120), 1.0f};
+                const float range = std::clamp(light.range, 0.01f, kMaxDrawnRange);
+                rangePen.circle(origin, axisX, axisY, range);
+                rangePen.circle(origin, axisX, axisZ, range);
+                rangePen.circle(origin, axisY, axisZ, range);
+            }
+
+        } else if (type == kLightSpot) {
+            label = "Spot light";
+
+            // A cone from the light with the light's own outer angle, as long
+            // as its range. A very wide cone is drawn shorter rather than
+            // narrower, so the shape stays true and the gizmo stays a
+            // reasonable size.
+            const float outer  = std::clamp(light.outerConeDegrees, 1.0f, 89.0f);
+            const float inner  = std::clamp(light.innerConeDegrees, 0.0f, outer);
+            const float tanOut = std::tan(glm::radians(outer));
+            const float length = std::max(std::min(std::clamp(light.range, 0.5f, 10.0f),
+                                                   kMaxConeRadius / tanOut), 0.3f);
+            const float radius = length * tanOut;
+            const glm::vec3 base = -axisZ * length;
+
+            pen.circle(origin, axisX, axisY, r * 0.5f);        // the lamp
+            pen.circle(base, axisX, axisY, radius);            // where the cone ends
+            pen.line(origin, base + axisX * radius);
+            pen.line(origin, base - axisX * radius);
+            pen.line(origin, base + axisY * radius);
+            pen.line(origin, base - axisY * radius);
+
+            // The inner cone (full strength) as a dimmer ring, selected light only.
+            if (selected && inner > 0.0f) {
+                const GizmoPen innerPen{draw, viewProj, model, x, y, width, height,
+                                        lightGizmoColor(tint, true, 120), 1.0f};
+                innerPen.circle(base, axisX, axisY, length * std::tan(glm::radians(inner)));
+            }
+        }
+
+        // Name the type of the selected light next to its symbol.
+        if (selected) {
+            const glm::vec4 clip = viewProj * world.matrix[3];
+            if (clip.w > 0.01f) {
+                const ImVec2 screen(x + (clip.x / clip.w * 0.5f + 0.5f) * width + 12.0f,
+                                    y + (1.0f - (clip.y / clip.w * 0.5f + 0.5f)) * height - 22.0f);
+                draw->AddText(screen, IM_COL32(255, 170, 40, 255), label);
+            }
+        }
+    }
+
+    draw->PopClipRect();
+}
+
 bool ViewportPanel::drawGizmo(float x, float y, float width, float height) {
     if (m_tool == Tool::Select) return false;
     if (width <= 0.0f || height <= 0.0f) return false;
@@ -394,6 +583,20 @@ entt::entity ViewportPanel::pickEntity(const Ray& ray) const {
 
         float t = 0.0f;
         if (intersectRayBox(ray, box, world.matrix, t) && t < bestT) {
+            bestT = t;
+            best  = entity;
+        }
+    }
+
+    // Lights have no mesh either: a small box around their symbol is the
+    // thing to click, so a light can be selected without the hierarchy.
+    auto lights = m_scene.registry().view<const LightComponent, const WorldTransform>();
+    for (auto [entity, light, world] : lights.each()) {
+        const float h = kLightPickHalfSize;
+        const Aabb  box{ {-h, -h, -h}, {h, h, h} };
+
+        float t = 0.0f;
+        if (intersectRayBox(ray, box, withoutScale(world.matrix), t) && t < bestT) {
             bestT = t;
             best  = entity;
         }

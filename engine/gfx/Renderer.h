@@ -130,6 +130,16 @@ public:
     /// Command buffer open for recording during the current frame.
     VkCommandBuffer currentCommandBuffer() const;
 
+    /**
+     * @brief Index of the frame slot being recorded, from 0 to
+     *        MAX_FRAMES_IN_FLIGHT - 1.
+     *
+     * Resources that the CPU rewrites every frame (such as uniform buffers)
+     * exist once per slot and are picked with this index. Valid between
+     * beginFrame() and endFrame().
+     */
+    uint32_t currentFrameIndex() const { return m_currentFrame; }
+
     /// @return Current swapchain image extent in pixels.
     VkExtent2D swapchainExtent() const { return m_swapchainExtent; }
 

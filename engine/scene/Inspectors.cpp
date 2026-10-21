@@ -14,6 +14,7 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/euler_angles.hpp>
 
+#include <algorithm>
 #include <cstdio>
 
 namespace fe {
@@ -105,6 +106,24 @@ bool inspect(LightComponent& l) {
 
     if (l.type != LightComponent::Type::Directional)
         changed |= ImGui::DragFloat("Range", &l.range, 0.1f, 0.0f, 1000.0f);
+
+    // Shadows are only implemented for directional lights so far.
+    if (l.type == LightComponent::Type::Directional)
+        changed |= ImGui::Checkbox("Cast Shadows", &l.castShadows);
+
+    if (l.type == LightComponent::Type::Spot) {
+        // Half-angles of the cone, in degrees. The light is full strength
+        // inside the inner cone and fades to nothing at the outer one, so
+        // the inner angle can never be wider than the outer: whichever of
+        // the two is being dragged pushes the other.
+        const bool outerChanged = ImGui::DragFloat("Outer angle", &l.outerConeDegrees,
+                                                   0.5f, 1.0f, 89.0f, "%.1f deg");
+        const bool innerChanged = ImGui::DragFloat("Inner angle", &l.innerConeDegrees,
+                                                   0.5f, 0.0f, 89.0f, "%.1f deg");
+        if (outerChanged) l.innerConeDegrees = std::min(l.innerConeDegrees, l.outerConeDegrees);
+        if (innerChanged) l.outerConeDegrees = std::max(l.outerConeDegrees, l.innerConeDegrees);
+        changed |= outerChanged || innerChanged;
+    }
 
     return changed;
 }

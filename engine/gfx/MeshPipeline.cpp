@@ -63,7 +63,8 @@ VkShaderModule MeshPipeline::loadShader(const char* path) const {
 bool MeshPipeline::init(const VulkanContext& ctx,
                         VkFormat colorFormat,
                         VkFormat depthFormat,
-                        const char* shaderDir) {
+                        const char* shaderDir,
+                        VkDescriptorSetLayout sceneLayout) {
     m_ctx = &ctx;
 
     // ---- Shader modules ----
@@ -155,7 +156,7 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates    = dynamicStates;
 
-    // ---- Pipeline layout (push constants only) ----
+    // ---- Pipeline layout: set 0 (scene data) + push constants ----
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushRange.offset     = 0;
@@ -163,6 +164,8 @@ bool MeshPipeline::init(const VulkanContext& ctx,
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount         = 1;
+    layoutInfo.pSetLayouts            = &sceneLayout;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges    = &pushRange;
 
@@ -226,6 +229,13 @@ void MeshPipeline::bind(VkCommandBuffer cmd, VkExtent2D extent) const {
     VkRect2D scissor{};
     scissor.extent = extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+void MeshPipeline::bindDescriptorSet(VkCommandBuffer cmd, VkDescriptorSet sceneSet) const {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
+                            0,               // first set number: set 0
+                            1, &sceneSet,
+                            0, nullptr);     // no dynamic offsets
 }
 
 void MeshPipeline::push(VkCommandBuffer cmd, const MeshPushConstants& pc) const {

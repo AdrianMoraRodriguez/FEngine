@@ -73,6 +73,20 @@ private:
     void drawCameraGizmos(float x, float y, float width, float height);
 
     /**
+     * @brief Draws a symbol for every light, selected or not.
+     *
+     *   - Directional: a disc with parallel rays and an arrow along the
+     *     direction the light travels.
+     *   - Point: a small bulb; the selected one also shows its range as a sphere.
+     *   - Spot: a cone as long as the range, with the light's own angle; the
+     *     selected one also shows its inner cone.
+     *
+     * The symbols are the same size whatever the entity's scale, and are
+     * orange when the light is selected.
+     */
+    void drawLightGizmos(float x, float y, float width, float height);
+
+    /**
      * @brief Draws and processes the transform gizmo of the selected entity.
      * @return `true` if a gizmo was active this frame (so ImGuizmo's hover
      *         state can be trusted).

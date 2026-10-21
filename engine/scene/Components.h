@@ -164,6 +164,10 @@ struct CameraComponent {
 
 /**
  * @brief A light source that contributes to scene illumination.
+ *
+ * Directional and spot lights shine along the entity's local -Z axis, like
+ * a camera looks, so rotating the entity aims them. Point and spot lights
+ * use the entity's position.
  */
 struct LightComponent {
     /// Light source type.
@@ -177,8 +181,17 @@ struct LightComponent {
     glm::vec3 color     {1.0f};          ///< Linear RGB emission colour.
     float     intensity = 1.0f;          ///< Brightness multiplier.
     float     range     = 10.0f;         ///< Maximum influence radius (Point/Spot).
-    float     innerCone = 0.9f;          ///< Cosine of the inner cone angle (Spot).
-    float     outerCone = 0.7f;          ///< Cosine of the outer cone angle (Spot).
+
+    /// Spot only. Half-angle, in degrees, of the cone that is fully lit.
+    float     innerConeDegrees = 25.0f;
+
+    /// Spot only. Half-angle, in degrees, where the light has faded to nothing.
+    /// Never smaller than innerConeDegrees.
+    float     outerConeDegrees = 30.0f;
+
+    /// Whether this light casts shadows. Only directional lights can so far,
+    /// and only the first one in the scene that has this set.
+    bool      castShadows = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -195,7 +208,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NameComponent, name)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Transform, position, rotation, scale)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MeshRenderer, mesh, material, castShadows)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(CameraComponent, fovDegrees, nearPlane, farPlane, primary)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LightComponent, type, color, intensity, range, innerCone, outerCone)
+
+// The WITH_DEFAULT variant fills in any key the file does not have. Scenes
+// saved before the cone angles were in degrees hold "innerCone" and
+// "outerCone" instead; they still load, with the default angles.
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(LightComponent, type, color, intensity, range,
+                                                innerConeDegrees, outerConeDegrees, castShadows)
 
 // ---------------------------------------------------------------------------
 // Inspector forward declarations

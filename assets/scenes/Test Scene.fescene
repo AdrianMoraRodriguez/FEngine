@@ -30,7 +30,7 @@
         }
       },
       "parent": 0,
-      "uuid": 13900108082671790190
+      "uuid": 17248782915011111144
     },
     {
       "components": {
@@ -62,7 +62,7 @@
         }
       },
       "parent": 0,
-      "uuid": 638287234380602890
+      "uuid": 8183304771483784691
     },
     {
       "components": {
@@ -94,7 +94,7 @@
         }
       },
       "parent": 0,
-      "uuid": 16955578597829919575
+      "uuid": 9284095276212053141
     },
     {
       "components": {
@@ -127,23 +127,69 @@
         }
       },
       "parent": 0,
-      "uuid": 891024305531675326
+      "uuid": 16191521418959585876
     },
     {
       "components": {
-        "MeshRenderer": {
-          "castShadows": true,
-          "material": 0,
-          "mesh": 17893963603531862916
+        "Light": {
+          "color": [
+            0.970588207244873,
+            0.9134947657585144,
+            0.0
+          ],
+          "innerConeDegrees": 25.0,
+          "intensity": 0.75,
+          "outerConeDegrees": 30.0,
+          "range": 10.0,
+          "type": 0
         },
         "Name": {
-          "name": "BoxCartridge"
+          "name": "Sun"
         },
         "Transform": {
           "position": [
-            0.25019001960754395,
-            2.384185791015625e-07,
-            2.6862998008728027
+            0.0,
+            6.0,
+            0.0
+          ],
+          "rotation": [
+            0.8621671199798584,
+            -0.4703885614871979,
+            0.1881554275751114,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 9411372820260282091
+    },
+    {
+      "components": {
+        "Light": {
+          "color": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "innerConeDegrees": 25.0,
+          "intensity": 8.0,
+          "outerConeDegrees": 30.0,
+          "range": 8.0,
+          "type": 1
+        },
+        "Name": {
+          "name": "Lamp"
+        },
+        "Transform": {
+          "position": [
+            2.5,
+            1.2000000476837158,
+            1.5
           ],
           "rotation": [
             1.0,
@@ -159,29 +205,36 @@
         }
       },
       "parent": 0,
-      "uuid": 14932922719799462936
+      "uuid": 18244406384513114609
     },
     {
       "components": {
-        "MeshRenderer": {
-          "castShadows": true,
-          "material": 0,
-          "mesh": 15466549172741761348
+        "Light": {
+          "color": [
+            0.0,
+            1.0,
+            0.6470587253570557
+          ],
+          "innerConeDegrees": 25.0,
+          "intensity": 15.0,
+          "outerConeDegrees": 30.0,
+          "range": 8.0,
+          "type": 2
         },
         "Name": {
-          "name": "DamagedHelmet"
+          "name": "Spotlight"
         },
         "Transform": {
           "position": [
-            4.074726581573486,
-            0.776032567024231,
-            1.186293363571167
+            -2.5,
+            4.0,
+            0.0
           ],
           "rotation": [
-            1.0,
-            0.0,
-            0.0,
-            0.0
+            0.7071067690849304,
+            -0.7071067690849304,
+            -0.0,
+            -0.0
           ],
           "scale": [
             1.0,
@@ -191,39 +244,7 @@
         }
       },
       "parent": 0,
-      "uuid": 7105377864111911659
-    },
-    {
-      "components": {
-        "MeshRenderer": {
-          "castShadows": true,
-          "material": 0,
-          "mesh": 10628146637226648293
-        },
-        "Name": {
-          "name": "Pocketwatch"
-        },
-        "Transform": {
-          "position": [
-            -3.8772830963134766,
-            0.0,
-            5.5530571937561035
-          ],
-          "rotation": [
-            1.0,
-            0.0,
-            0.0,
-            0.0
-          ],
-          "scale": [
-            1.0,
-            1.0,
-            1.0
-          ]
-        }
-      },
-      "parent": 0,
-      "uuid": 16843647069316479992
+      "uuid": 8570207641757985618
     }
   ],
   "name": "Test Scene",

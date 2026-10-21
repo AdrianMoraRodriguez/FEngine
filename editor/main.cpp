@@ -24,6 +24,7 @@
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
+#include <glm/gtx/quaternion.hpp>
 #include <exception>
 #include <cstdlib>
 
@@ -196,7 +197,7 @@ entt::entity addMeshEntity(fe::Scene& scene,
 // ---------------------------------------------------------------------------
 
 int main() {
-        // If an exception ever escapes, say what it was before the program dies.
+    // If an exception ever escapes, say what it was before the program dies.
     // Without this, the only trace is a bare "abort() has been called".
     std::set_terminate([] {
         if (std::exception_ptr error = std::current_exception()) {
@@ -210,6 +211,7 @@ int main() {
         }
         std::abort();
     });
+
     // Resolve shader paths relative to the executable, not the working
     // directory. Assets stay relative to the working directory because they
     // belong to the project, not to the editor binary.
@@ -257,6 +259,40 @@ int main() {
         entt::entity camera = scene.create("Camera");
         scene.registry().emplace<fe::CameraComponent>(camera);
         scene.transform(camera).position = {0.0f, 5.0f, 10.0f};
+
+        // A sun, so the lighting can be seen changing: rotate this entity
+        // and the shading of every object follows. A light shines along its
+        // local -Z axis, so it starts rotated to point the same way as the
+        // engine's default light (the direction used when a scene has none).
+        entt::entity sun = scene.create("Sun");
+        fe::LightComponent light;
+        light.type      = fe::LightComponent::Type::Directional;
+        light.intensity = 0.75f;   // matches the default light's brightness
+        scene.registry().emplace<fe::LightComponent>(sun, light);
+        scene.transform(sun).position = {0.0f, 6.0f, 0.0f};
+        scene.transform(sun).rotation = glm::rotation(
+            glm::vec3(0.0f, 0.0f, -1.0f),
+            glm::normalize(glm::vec3(-0.4f, -1.0f, -0.6f)));
+
+        // A lamp: a point light shines in every direction and fades out at its range.
+        entt::entity lamp = scene.create("Lamp");
+        fe::LightComponent lampLight;
+        lampLight.type      = static_cast<fe::LightComponent::Type>(1);   // Point
+        lampLight.intensity = 8.0f;
+        lampLight.range     = 8.0f;
+        scene.registry().emplace<fe::LightComponent>(lamp, lampLight);
+        scene.transform(lamp).position = {2.5f, 1.2f, 1.5f};
+
+        // A spotlight aimed straight down: forward is -Z, so rotate -Z onto -Y.
+        entt::entity spot = scene.create("Spotlight");
+        fe::LightComponent spotLight;
+        spotLight.type      = static_cast<fe::LightComponent::Type>(2);   // Spot
+        spotLight.intensity = 15.0f;
+        spotLight.range     = 8.0f;
+        scene.registry().emplace<fe::LightComponent>(spot, spotLight);
+        scene.transform(spot).position = {-2.5f, 4.0f, 0.0f};
+        scene.transform(spot).rotation = glm::rotation(
+            glm::vec3(0.0f, 0.0f, -1.0f), glm::vec3(0.0f, -1.0f, 0.0f));
 
         scene.updateTransforms();
     }
@@ -325,19 +361,25 @@ int main() {
 
         VkCommandBuffer cmd = renderer.currentCommandBuffer();
 
-        // 1. Scene pass: draw the scene into the offscreen buffer.
+        // 1. Shadow pass: the scene seen from the sun, depth only. It also
+        //    uploads this frame's lights, so it comes before the scene pass.
+        sceneRenderer.renderShadows(cmd, scene, renderer.currentFrameIndex());
+
+        // 2. Scene pass: draw the scene into the offscreen buffer.
         fe::Renderer::beginOffscreenPass(cmd, offscreen);
 
         const float aspect = static_cast<float>(offscreen.width()) /
                              static_cast<float>(offscreen.height());
         const glm::mat4 viewProj = editorCamera.projection(aspect) * editorCamera.view();
 
+        // The frame index picks this frame slot's copy of the scene's lights.
         sceneRenderer.render(cmd, scene, viewProj,
-                             {offscreen.width(), offscreen.height()});
+                             {offscreen.width(), offscreen.height()},
+                             renderer.currentFrameIndex());
 
         fe::Renderer::endOffscreenPass(cmd, offscreen);
 
-        // 2. Swapchain pass: ImGui on top (the Viewport panel samples the
+        // 3. Swapchain pass: ImGui on top (the Viewport panel samples the
         //    offscreen colour image).
         renderer.beginSwapchainPass();
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
