@@ -107,9 +107,7 @@ bool inspect(LightComponent& l) {
     if (l.type != LightComponent::Type::Directional)
         changed |= ImGui::DragFloat("Range", &l.range, 0.1f, 0.0f, 1000.0f);
 
-    // Shadows are only implemented for directional lights so far.
-    if (l.type == LightComponent::Type::Directional)
-        changed |= ImGui::Checkbox("Cast Shadows", &l.castShadows);
+    changed |= ImGui::Checkbox("Cast Shadows", &l.castShadows);
 
     if (l.type == LightComponent::Type::Spot) {
         // Half-angles of the cone, in degrees. The light is full strength

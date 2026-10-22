@@ -9,12 +9,15 @@
 #include "gfx/MeshLibrary.h"
 #include "gfx/MeshPipeline.h"
 #include "gfx/SceneUniforms.h"
+#include "gfx/ShadowCube.h"
 #include "gfx/ShadowMap.h"
 #include "gfx/ShadowPipeline.h"
 #include "scene/Scene.h"
 
 #include <vulkan/vulkan.h>
 #include <glm/glm.hpp>
+
+#include <array>
 
 namespace fe {
 
@@ -44,13 +47,18 @@ class VulkanContext;
  * (Lambert) term; there are no specular highlights yet.
  *
  * ### Shadows
- * One light casts shadows: the first directional light with castShadows set.
- * Every MeshRenderer with castShadows set is drawn into a shadow map from
- * that light's point of view, and the main pass darkens what the map says is
- * hidden from the light. The map covers a box that fits all the casters in
- * the scene, so it gets less sharp as the scene grows; the default sun used
- * by scenes without lights casts no shadows. Point and spot shadows are not
- * implemented yet.
+ * Every light with castShadows set casts shadows, while shadow maps last: up
+ * to kMaxShadowCasters (4) directional and spot lights, and up to
+ * kMaxPointShadowCasters (2) point lights, in the order the lights are
+ * found. Every MeshRenderer with castShadows set is drawn from the light's
+ * point of view into its shadow map, and the main pass darkens what the map
+ * says is hidden from the light.
+ *   - A directional light's map covers a box that fits all the casters in the
+ *     scene, so it gets less sharp as the scene grows.
+ *   - A spot light's map covers its cone, up to its range.
+ *   - A point light needs six maps, one per direction (a cube), and covers
+ *     everything within its range.
+ * The default sun used by scenes without lights casts no shadows.
  *
  * Intensity is the light's brightness at about one unit of distance for point
  * and spot lights, which then fade with the square of the distance and reach
@@ -135,15 +143,20 @@ public:
 
 private:
     /// Collects the scene's lights into the block the shaders read. Also
-    /// picks the shadow-casting light (SceneUniformData::lightCount.y).
+    /// gives each shadow-casting light a shadow map slot (GpuLight::spotCone.z).
     static SceneUniformData gatherLights(const Scene& scene);
 
-    /// Builds the shadow light's view-projection so that it covers every
-    /// shadow caster. @return `false` if there is no caster to cover.
-    bool fitShadowFrustum(const Scene& scene, const glm::vec3& lightDirection,
-                          glm::mat4& outViewProj, float& outRadius) const;
+    /// Builds the view-projection of a directional shadow light so that it
+    /// covers every shadow caster. @return `false` if there is no caster.
+    bool fitDirectionalShadow(const Scene& scene, const glm::vec3& lightDirection,
+                              glm::mat4& outViewProj, float& outRadius) const;
 
-    ShadowMap      m_shadowMap;
+    /// Draws every shadow caster into the map that is currently open.
+    void drawShadowCasters(VkCommandBuffer cmd, const Scene& scene,
+                           const glm::mat4& lightViewProj) const;
+
+    std::array<ShadowMap,  kMaxShadowCasters>      m_shadowMaps;
+    std::array<ShadowCube, kMaxPointShadowCasters> m_shadowCubes;
     ShadowPipeline m_shadowPipeline;
     SceneUniforms  m_uniforms;
     MeshPipeline   m_pipeline;

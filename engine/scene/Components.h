@@ -189,8 +189,9 @@ struct LightComponent {
     /// Never smaller than innerConeDegrees.
     float     outerConeDegrees = 30.0f;
 
-    /// Whether this light casts shadows. Only directional lights can so far,
-    /// and only the first one in the scene that has this set.
+    /// Whether this light casts shadows. The scene has room for
+    /// kMaxShadowCasters directional and spot lights and kMaxPointShadowCasters
+    /// point lights that do.
     bool      castShadows = true;
 };
 

@@ -15,6 +15,7 @@
 #include <vk_mem_alloc.h>
 #include <glm/glm.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -24,6 +25,14 @@ class VulkanContext;
 
 /// Most lights the shaders can use at once. Extra lights in a scene are ignored.
 constexpr uint32_t kMaxLights = 16;
+
+/// Most lights that can cast shadows at once. Each one owns a shadow map
+/// (see ShadowMap), so this is also the number of shadow maps in memory.
+constexpr uint32_t kMaxShadowCasters = 4;
+
+/// Most point lights that can cast shadows at once. A point light needs a
+/// whole cube of six shadow maps (see ShadowCube), so this is kept small.
+constexpr uint32_t kMaxPointShadowCasters = 2;
 
 /// Values of GpuLight::colorType.w.
 constexpr float kGpuLightDirectional = 0.0f;
@@ -46,10 +55,14 @@ struct GpuLight {
     /// xyz: direction the light travels (directional and spot). w: unused.
     glm::vec4 direction{0.0f, -1.0f, 0.0f, 0.0f};
 
-    /// Spot only. x: cosine of the outer half-angle (where the light is gone).
-    /// y: cosine of the inner half-angle (where it is at full strength).
+    /// x: spot only, cosine of the outer half-angle (where the light is gone).
+    /// y: spot only, cosine of the inner half-angle (where it is at full strength).
     /// Cosines, not angles, so the shader compares them with a dot product directly.
-    glm::vec4 spotCone{0.0f};
+    /// z: which shadow map this light uses, or -1 if it casts no shadows. A
+    ///    point light counts in its own list of cubes (0 .. kMaxPointShadowCasters - 1);
+    ///    directional and spot lights in the list of flat maps (0 .. kMaxShadowCasters - 1).
+    /// w: unused.
+    glm::vec4 spotCone{0.0f, 0.0f, -1.0f, 0.0f};
 };
 
 /**
@@ -62,31 +75,42 @@ struct SceneUniformData {
     /// Light that reaches every surface regardless of its orientation.
     glm::vec4 ambientColor{0.25f, 0.25f, 0.25f, 0.0f};
 
-    /// x: how many entries of `lights` are in use.
-    /// y: index of the light that casts shadows, or -1 for none.
-    /// zw: padding.
-    glm::ivec4 lightCount{0, -1, 0, 0};
+    /// x: how many entries of `lights` are in use. yzw: padding.
+    glm::ivec4 lightCount{0};
 
-    /// World space -> the shadow map's clip space (the shadow light's view-projection).
-    glm::mat4 lightViewProj{1.0f};
+    /// For each shadow map: world space -> that map's clip space (the
+    /// shadow-casting light's view-projection).
+    glm::mat4 shadowViewProj[kMaxShadowCasters];
 
-    /// x: size of one shadow-map texel in texture coordinates (1 / resolution).
-    /// y: how far, in world units, the shadow lookup is pushed along the surface normal.
-    /// zw: unused.
-    glm::vec4 shadowParams{0.0f};
+    /// For each shadow map.
+    /// x: size of one texel in texture coordinates (1 / resolution).
+    /// y: how far the shadow lookup is pushed along the surface normal, in
+    ///    world units (directional) or in world units per unit of distance
+    ///    to the light (spot).
+    /// z: 1 if y must be multiplied by the distance to the light, else 0.
+    /// w: unused.
+    glm::vec4 shadowParams[kMaxShadowCasters];
+
+    /// For the point lights' shadow cubes, which all share these values.
+    /// x: size of one texel on a cube face, per unit of distance to the light.
+    /// y: how far the shadow lookup is pushed along the surface normal, per unit of distance.
+    /// z: near plane of every face's projection. w: unused.
+    glm::vec4 pointShadowParams{0.0f};
 
     GpuLight lights[kMaxLights];
 };
 
 static_assert(sizeof(GpuLight) == 64,
               "GpuLight must match the std140 struct in mesh.frag");
-static_assert(offsetof(SceneUniformData, lightViewProj) == 32,
-              "The shadow matrix must start right after the two vec4s");
-static_assert(offsetof(SceneUniformData, shadowParams) == 96,
-              "The shadow parameters must follow the shadow matrix");
-static_assert(offsetof(SceneUniformData, lights) == 112,
+static_assert(offsetof(SceneUniformData, shadowViewProj) == 32,
+              "The shadow matrices must start right after the two vec4s");
+static_assert(offsetof(SceneUniformData, shadowParams) == 32 + 64 * kMaxShadowCasters,
+              "The shadow parameters must follow the shadow matrices");
+static_assert(offsetof(SceneUniformData, pointShadowParams) == 32 + 80 * kMaxShadowCasters,
+              "The cube shadow parameters must follow the flat shadow data");
+static_assert(offsetof(SceneUniformData, lights) == 48 + 80 * kMaxShadowCasters,
               "The light array must start after the shadow data");
-static_assert(sizeof(SceneUniformData) == 112 + 64 * kMaxLights,
+static_assert(sizeof(SceneUniformData) == 48 + 80 * kMaxShadowCasters + 64 * kMaxLights,
               "SceneUniformData must match the std140 block in mesh.frag");
 
 /**
@@ -119,16 +143,23 @@ public:
     /**
      * @brief Creates the descriptor layout, pool, buffers and sets.
      *
-     * Set 0 has two bindings: 0 is the uniform buffer with SceneUniformData,
-     * 1 is the shadow map. The shadow map never changes, so every set is
-     * pointed at it once, here.
+     * Set 0 has three bindings: 0 is the uniform buffer with SceneUniformData,
+     * 1 is an array with the flat shadow maps and 2 an array with the shadow
+     * cubes. The shadow maps never change, so every set is pointed at them
+     * once, here.
      *
-     * @param ctx           Initialised Vulkan context.
-     * @param shadowView    View of the shadow map (ShadowMap::view()).
-     * @param shadowSampler Comparison sampler for it (ShadowMap::sampler()).
+     * @param ctx            Initialised Vulkan context.
+     * @param shadowViews    View of each flat shadow map (ShadowMap::view()).
+     * @param shadowSamplers Comparison sampler of each (ShadowMap::sampler()).
+     * @param cubeViews      View of each shadow cube (ShadowCube::view()).
+     * @param cubeSamplers   Comparison sampler of each (ShadowCube::sampler()).
      * @return `true` on success.
      */
-    bool init(const VulkanContext& ctx, VkImageView shadowView, VkSampler shadowSampler);
+    bool init(const VulkanContext& ctx,
+              const std::array<VkImageView, kMaxShadowCasters>& shadowViews,
+              const std::array<VkSampler,   kMaxShadowCasters>& shadowSamplers,
+              const std::array<VkImageView, kMaxPointShadowCasters>& cubeViews,
+              const std::array<VkSampler,   kMaxPointShadowCasters>& cubeSamplers);
 
     /// Destroys everything. Safe to call more than once.
     void shutdown();

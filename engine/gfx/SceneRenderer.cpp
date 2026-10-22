@@ -11,6 +11,38 @@
 #include <limits>
 
 namespace fe {
+namespace {
+
+/// View matrix of one face of a point light's shadow cube.
+///
+/// The axes are the ones the Vulkan specification gives for each cube-map
+/// layer (0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z): for a direction
+/// d, the face's "right" and "up" give the texture coordinates (s, t) the GPU
+/// looks up, and the "forward" axis is the one the direction mostly points
+/// along. The rows of a view matrix are right, up and minus forward.
+glm::mat4 cubeFaceView(uint32_t face, const glm::vec3& position) {
+    struct Axes { glm::vec3 right, up, forward; };
+    static const Axes kFaces[ShadowCube::kFaces] = {
+        {{ 0.0f, 0.0f,-1.0f}, { 0.0f,-1.0f, 0.0f}, { 1.0f, 0.0f, 0.0f}},   // +X
+        {{ 0.0f, 0.0f, 1.0f}, { 0.0f,-1.0f, 0.0f}, {-1.0f, 0.0f, 0.0f}},   // -X
+        {{ 1.0f, 0.0f, 0.0f}, { 0.0f, 0.0f, 1.0f}, { 0.0f, 1.0f, 0.0f}},   // +Y
+        {{ 1.0f, 0.0f, 0.0f}, { 0.0f, 0.0f,-1.0f}, { 0.0f,-1.0f, 0.0f}},   // -Y
+        {{ 1.0f, 0.0f, 0.0f}, { 0.0f,-1.0f, 0.0f}, { 0.0f, 0.0f, 1.0f}},   // +Z
+        {{-1.0f, 0.0f, 0.0f}, { 0.0f,-1.0f, 0.0f}, { 0.0f, 0.0f,-1.0f}},   // -Z
+    };
+    const Axes& a = kFaces[face];
+
+    // glm matrices are indexed [column][row].
+    glm::mat4 rotation(1.0f);
+    for (int c = 0; c < 3; ++c) {
+        rotation[c][0] =  a.right[c];
+        rotation[c][1] =  a.up[c];
+        rotation[c][2] = -a.forward[c];
+    }
+    return rotation * glm::translate(glm::mat4(1.0f), -position);
+}
+
+} // namespace
 
 bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
     if (!m_meshes.init(ctx)) return false;
@@ -18,8 +50,23 @@ bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
     // The shadow map comes before the uniforms (their descriptor sets point
     // at it), and the uniforms before the pipeline (its layout is built from
     // their descriptor set layout).
-    if (!m_shadowMap.init(ctx)) return false;
-    if (!m_uniforms.init(ctx, m_shadowMap.view(), m_shadowMap.sampler())) return false;
+    std::array<VkImageView, kMaxShadowCasters> views{};
+    std::array<VkSampler,   kMaxShadowCasters> samplers{};
+    for (uint32_t i = 0; i < kMaxShadowCasters; ++i) {
+        if (!m_shadowMaps[i].init(ctx)) return false;
+        views[i]    = m_shadowMaps[i].view();
+        samplers[i] = m_shadowMaps[i].sampler();
+    }
+
+    std::array<VkImageView, kMaxPointShadowCasters> cubeViews{};
+    std::array<VkSampler,   kMaxPointShadowCasters> cubeSamplers{};
+    for (uint32_t i = 0; i < kMaxPointShadowCasters; ++i) {
+        if (!m_shadowCubes[i].init(ctx)) return false;
+        cubeViews[i]    = m_shadowCubes[i].view();
+        cubeSamplers[i] = m_shadowCubes[i].sampler();
+    }
+
+    if (!m_uniforms.init(ctx, views, samplers, cubeViews, cubeSamplers)) return false;
 
     if (!m_shadowPipeline.init(ctx, ShadowMap::kFormat, shaderDir)) return false;
 
@@ -34,7 +81,8 @@ void SceneRenderer::shutdown() {
     m_pipeline.shutdown();
     m_shadowPipeline.shutdown();
     m_uniforms.shutdown();
-    m_shadowMap.shutdown();
+    for (ShadowMap& map : m_shadowMaps) map.shutdown();
+    for (ShadowCube& cube : m_shadowCubes) cube.shutdown();
     m_meshes.shutdown();
 }
 
@@ -49,6 +97,8 @@ void SceneRenderer::prepare(const Scene& scene) {
 SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
     SceneUniformData data;
     int count = 0;
+    uint32_t nextShadowSlot = 0;       // flat maps: directional and spot lights
+    uint32_t nextCubeSlot   = 0;       // shadow cubes: point lights
 
     auto lights = scene.registry().view<const LightComponent, const WorldTransform>();
     for (auto [entity, light, world] : lights.each()) {
@@ -90,18 +140,32 @@ SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
                 const float outer = std::clamp(light.outerConeDegrees, 1.0f, 89.0f);
                 const float inner = std::clamp(light.innerConeDegrees, 0.0f, outer);
                 out.spotCone = glm::vec4(std::cos(glm::radians(outer)),
-                                         std::cos(glm::radians(inner)), 0.0f, 0.0f);
+                                         std::cos(glm::radians(inner)), -1.0f, 0.0f);
                 break;
             }
 
             case LightComponent::Type::Directional:
             default:
                 out.colorType = glm::vec4(color, kGpuLightDirectional);
-
-                // The first directional light that asks for it casts the shadows.
-                if (light.castShadows && data.lightCount.y < 0)
-                    data.lightCount.y = count;
                 break;
+        }
+
+        // A light that asks for it gets a shadow map of its own kind, while
+        // there are some left: a cube for a point light, a flat map otherwise.
+        if (light.castShadows) {
+            const bool isPoint = light.type == LightComponent::Type::Point;
+            uint32_t&      next  = isPoint ? nextCubeSlot : nextShadowSlot;
+            const uint32_t limit = isPoint ? kMaxPointShadowCasters : kMaxShadowCasters;
+
+            if (next < limit) {
+                out.spotCone.z = static_cast<float>(next++);
+            } else {
+                static bool warned = false;
+                if (!warned) {
+                    FE_WARN("SceneRenderer: more shadow-casting lights than shadow maps; the extra ones cast no shadows");
+                    warned = true;
+                }
+            }
         }
         ++count;
     }
@@ -120,10 +184,10 @@ SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
     return data;
 }
 
-bool SceneRenderer::fitShadowFrustum(const Scene& scene,
-                                     const glm::vec3& lightDirection,
-                                     glm::mat4& outViewProj,
-                                     float& outRadius) const {
+bool SceneRenderer::fitDirectionalShadow(const Scene& scene,
+                                         const glm::vec3& lightDirection,
+                                         glm::mat4& outViewProj,
+                                         float& outRadius) const {
     // World-space box around every shadow caster.
     glm::vec3 lo( std::numeric_limits<float>::max());
     glm::vec3 hi(-std::numeric_limits<float>::max());
@@ -169,54 +233,133 @@ bool SceneRenderer::fitShadowFrustum(const Scene& scene,
     return true;
 }
 
+void SceneRenderer::drawShadowCasters(VkCommandBuffer cmd, const Scene& scene,
+                                      const glm::mat4& lightViewProj) const {
+    m_shadowPipeline.bind(cmd);
+
+    auto view = scene.registry().view<const MeshRenderer, const WorldTransform>();
+    for (auto [entity, renderer, world] : view.each()) {
+        if (!renderer.castShadows) continue;
+
+        const MeshBuffer* mesh = m_meshes.get(renderer.mesh);
+        if (!mesh) continue;
+
+        m_shadowPipeline.push(cmd, ShadowPushConstants{lightViewProj * world.matrix});
+        mesh->draw(cmd);
+    }
+}
+
 void SceneRenderer::renderShadows(VkCommandBuffer cmd,
                                   const Scene& scene,
                                   uint32_t frameIndex) {
     SceneUniformData data = gatherLights(scene);
 
-    // Is there a shadow-casting light, and anything for it to cast?
-    glm::mat4 lightViewProj{1.0f};
-    bool casting = false;
+    // Which light owns each shadow map, found from the slot gatherLights()
+    // wrote into the light. -1 means the map is free this frame. Point lights
+    // number their cubes separately from the flat maps.
+    int slotLight[kMaxShadowCasters];
+    int cubeLight[kMaxPointShadowCasters];
+    for (int& l : slotLight) l = -1;
+    for (int& l : cubeLight) l = -1;
+    for (int i = 0; i < data.lightCount.x; ++i) {
+        const int slot = static_cast<int>(data.lights[i].spotCone.z);
+        if (slot < 0) continue;
+        if (data.lights[i].colorType.w == kGpuLightPoint) cubeLight[slot] = i;
+        else                                              slotLight[slot] = i;
+    }
 
-    if (data.lightCount.y >= 0) {
-        const glm::vec3 direction = glm::vec3(data.lights[data.lightCount.y].direction);
-        float radius = 0.0f;
+    const float resolution = static_cast<float>(ShadowMap::kResolution);
 
-        if (fitShadowFrustum(scene, direction, lightViewProj, radius)) {
-            casting = true;
+    for (uint32_t slot = 0; slot < kMaxShadowCasters; ++slot) {
+        // Every map goes through begin() and end() every frame, even the ones
+        // nobody uses: that keeps all of them in the layout the shader's
+        // descriptors promise.
+        bool casting = false;
+        glm::mat4 lightViewProj{1.0f};
 
-            const float resolution = static_cast<float>(ShadowMap::kResolution);
-            const float texelWorld = 2.0f * radius / resolution;   // one texel, in world units
+        if (slotLight[slot] >= 0) {
+            GpuLight& light = data.lights[slotLight[slot]];
+            const glm::vec3 direction = glm::vec3(light.direction);
 
-            data.lightViewProj = lightViewProj;
-            data.shadowParams  = glm::vec4(1.0f / resolution, 1.5f * texelWorld, 0.0f, 0.0f);
-        } else {
-            data.lightCount.y = -1;   // nothing to cast: the shader skips the lookup
+            if (light.colorType.w == kGpuLightSpot) {
+                // A spot light sees the cone it lights, plus a little margin,
+                // through a perspective projection. The far plane is the
+                // light's range: nothing beyond it is lit anyway.
+                const float outer = std::acos(std::clamp(light.spotCone.x, -1.0f, 1.0f));
+                const float fov   = std::min(2.0f * outer + glm::radians(2.0f), glm::radians(170.0f));
+                const float nearPlane = 0.1f;
+                const float farPlane  = std::max(light.positionRange.w, nearPlane + 0.1f);
+
+                const glm::vec3 position = glm::vec3(light.positionRange);
+                const glm::vec3 up = std::abs(direction.y) > 0.99f ? glm::vec3(0.0f, 0.0f, 1.0f)
+                                                                   : glm::vec3(0.0f, 1.0f, 0.0f);
+                lightViewProj = glm::perspective(fov, 1.0f, nearPlane, farPlane)
+                              * glm::lookAt(position, position + direction, up);
+                casting = true;
+
+                // One texel covers 2 * tan(fov / 2) / resolution world units per
+                // unit of distance to the light.
+                const float texelPerDistance = 2.0f * std::tan(0.5f * fov) / resolution;
+                data.shadowParams[slot] = glm::vec4(1.0f / resolution, 1.5f * texelPerDistance, 1.0f, 0.0f);
+            } else {
+                float radius = 0.0f;
+                if (fitDirectionalShadow(scene, direction, lightViewProj, radius)) {
+                    casting = true;
+
+                    const float texelWorld = 2.0f * radius / resolution;   // one texel, in world units
+                    data.shadowParams[slot] = glm::vec4(1.0f / resolution, 1.5f * texelWorld, 0.0f, 0.0f);
+                } else {
+                    light.spotCone.z = -1.0f;   // nothing to cast: the shader skips the lookup
+                }
+            }
         }
+        data.shadowViewProj[slot] = lightViewProj;
+
+        m_shadowMaps[slot].begin(cmd);
+        if (casting) drawShadowCasters(cmd, scene, lightViewProj);
+        m_shadowMaps[slot].end(cmd);
+    }
+
+    // ---- Point lights: six views per light, one cube each ----
+    // Every face has a 90 degree field of view, so six of them cover the whole
+    // sphere around the light. The near plane is a constant shared with the
+    // shader; the far plane is the light's range.
+    constexpr float kCubeNear = 0.05f;
+    const float cubeResolution = static_cast<float>(ShadowCube::kResolution);
+    data.pointShadowParams = glm::vec4(2.0f / cubeResolution,          // one texel, per unit of distance
+                                       1.5f * 2.0f / cubeResolution,   // normal offset, per unit of distance
+                                       kCubeNear, 0.0f);
+
+    for (uint32_t slot = 0; slot < kMaxPointShadowCasters; ++slot) {
+        // As with the flat maps, every cube is begun and ended every frame.
+        m_shadowCubes[slot].begin(cmd);
+
+        if (cubeLight[slot] >= 0) {
+            GpuLight& light = data.lights[cubeLight[slot]];
+            const glm::vec3 position = glm::vec3(light.positionRange);
+            const float farPlane = std::max(light.positionRange.w, kCubeNear + 0.1f);
+
+            for (uint32_t face = 0; face < ShadowCube::kFaces; ++face) {
+                const glm::mat4 faceViewProj = glm::perspective(glm::radians(90.0f), 1.0f, kCubeNear, farPlane)
+                                             * cubeFaceView(face, position);
+                m_shadowCubes[slot].beginFace(cmd, face);
+                drawShadowCasters(cmd, scene, faceViewProj);
+                m_shadowCubes[slot].endFace(cmd);
+            }
+        } else {
+            // Nobody uses this cube: still clear each face, so that every
+            // layer ends up in the layout the descriptors promise.
+            for (uint32_t face = 0; face < ShadowCube::kFaces; ++face) {
+                m_shadowCubes[slot].beginFace(cmd, face);
+                m_shadowCubes[slot].endFace(cmd);
+            }
+        }
+
+        m_shadowCubes[slot].end(cmd);
     }
 
     // The GPU reads the lights when the scene pass executes, later in this frame.
     m_uniforms.update(frameIndex, data);
-
-    // The pass always runs, so the map is always in the layout the shader expects.
-    m_shadowMap.begin(cmd);
-
-    if (casting) {
-        m_shadowPipeline.bind(cmd);
-
-        auto view = scene.registry().view<const MeshRenderer, const WorldTransform>();
-        for (auto [entity, renderer, world] : view.each()) {
-            if (!renderer.castShadows) continue;
-
-            const MeshBuffer* mesh = m_meshes.get(renderer.mesh);
-            if (!mesh) continue;
-
-            m_shadowPipeline.push(cmd, ShadowPushConstants{lightViewProj * world.matrix});
-            mesh->draw(cmd);
-        }
-    }
-
-    m_shadowMap.end(cmd);
 }
 
 void SceneRenderer::render(VkCommandBuffer cmd,

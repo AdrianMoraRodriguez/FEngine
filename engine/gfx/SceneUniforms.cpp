@@ -10,16 +10,20 @@ namespace fe {
 SceneUniforms::~SceneUniforms() { shutdown(); }
 
 bool SceneUniforms::init(const VulkanContext& ctx,
-                         VkImageView shadowView, VkSampler shadowSampler) {
+                         const std::array<VkImageView, kMaxShadowCasters>& shadowViews,
+                         const std::array<VkSampler,   kMaxShadowCasters>& shadowSamplers,
+                         const std::array<VkImageView, kMaxPointShadowCasters>& cubeViews,
+                         const std::array<VkSampler,   kMaxPointShadowCasters>& cubeSamplers) {
     m_ctx = &ctx;
     constexpr uint32_t kFrames = Renderer::MAX_FRAMES_IN_FLIGHT;
 
     // ------------------------------------------------------------------
     // 1. Layout: the contract.
     //      binding 0: uniform buffer with the lights (both stages can read it)
-    //      binding 1: the shadow map, a sampled image read by fragment shaders
+    //      binding 1: the flat shadow maps, an array of sampled images read by fragment shaders
+    //      binding 2: the shadow cubes of the point lights, likewise
     // ------------------------------------------------------------------
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    VkDescriptorSetLayoutBinding bindings[3]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -27,12 +31,17 @@ bool SceneUniforms::init(const VulkanContext& ctx,
 
     bindings[1].binding         = 1;
     bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[1].descriptorCount = 1;
+    bindings[1].descriptorCount = kMaxShadowCasters;
     bindings[1].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    bindings[2].binding         = 2;
+    bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorCount = kMaxPointShadowCasters;
+    bindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 2;
+    layoutInfo.bindingCount = 3;
     layoutInfo.pBindings    = bindings;
 
     if (vkCreateDescriptorSetLayout(ctx.device(), &layoutInfo, nullptr,
@@ -49,7 +58,7 @@ bool SceneUniforms::init(const VulkanContext& ctx,
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = kFrames;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFrames;
+    poolSizes[1].descriptorCount = kFrames * (kMaxShadowCasters + kMaxPointShadowCasters);
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -118,15 +127,24 @@ bool SceneUniforms::init(const VulkanContext& ctx,
         bufferDescriptor.offset = 0;
         bufferDescriptor.range  = sizeof(SceneUniformData);
 
-        // Point binding 1 at the shadow map. The image is always in
+        // Point binding 1 at the shadow maps. Every image is always in
         // SHADER_READ_ONLY_OPTIMAL by the time a draw call reads it
         // (ShadowMap::end() leaves it there).
-        VkDescriptorImageInfo shadowDescriptor{};
-        shadowDescriptor.sampler     = shadowSampler;
-        shadowDescriptor.imageView   = shadowView;
-        shadowDescriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo shadowDescriptors[kMaxShadowCasters]{};
+        for (uint32_t m = 0; m < kMaxShadowCasters; ++m) {
+            shadowDescriptors[m].sampler     = shadowSamplers[m];
+            shadowDescriptors[m].imageView   = shadowViews[m];
+            shadowDescriptors[m].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
 
-        VkWriteDescriptorSet writes[2]{};
+        VkDescriptorImageInfo cubeDescriptors[kMaxPointShadowCasters]{};
+        for (uint32_t m = 0; m < kMaxPointShadowCasters; ++m) {
+            cubeDescriptors[m].sampler     = cubeSamplers[m];
+            cubeDescriptors[m].imageView   = cubeViews[m];
+            cubeDescriptors[m].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        VkWriteDescriptorSet writes[3]{};
         writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet          = slot.set;
         writes[0].dstBinding      = 0;
@@ -137,10 +155,17 @@ bool SceneUniforms::init(const VulkanContext& ctx,
         writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[1].dstSet          = slot.set;
         writes[1].dstBinding      = 1;
-        writes[1].descriptorCount = 1;
+        writes[1].descriptorCount = kMaxShadowCasters;
         writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].pImageInfo      = &shadowDescriptor;
-        vkUpdateDescriptorSets(ctx.device(), 2, writes, 0, nullptr);
+        writes[1].pImageInfo      = shadowDescriptors;
+
+        writes[2].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet          = slot.set;
+        writes[2].dstBinding      = 2;
+        writes[2].descriptorCount = kMaxPointShadowCasters;
+        writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2].pImageInfo      = cubeDescriptors;
+        vkUpdateDescriptorSets(ctx.device(), 3, writes, 0, nullptr);
 
         // Valid contents from the start, in case a frame draws before update().
         update(i, initial);
