@@ -108,6 +108,15 @@ bool inspect(LightComponent& l) {
         changed |= ImGui::DragFloat("Range", &l.range, 0.1f, 0.0f, 1000.0f);
 
     changed |= ImGui::Checkbox("Cast Shadows", &l.castShadows);
+    if (l.castShadows) {
+        // The same number means two things: the light's radius in world units
+        // for point and spot lights, its angular radius for the sun.
+        if (l.type == LightComponent::Type::Directional)
+            changed |= ImGui::DragFloat("Light Angle", &l.shadowSoftness, 0.05f, 0.0f, 10.0f, "%.2f deg");
+        else
+            changed |= ImGui::DragFloat("Light Size", &l.shadowSoftness, 0.005f, 0.0f, 3.0f, "%.3f");
+        l.shadowSoftness = std::max(l.shadowSoftness, 0.0f);
+    }
 
     if (l.type == LightComponent::Type::Spot) {
         // Half-angles of the cone, in degrees. The light is full strength

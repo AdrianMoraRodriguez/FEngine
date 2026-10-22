@@ -13,6 +13,22 @@
 namespace fe {
 namespace {
 
+static_assert(kShadowCascades == ShadowCascades::kCascades,
+              "The shader and the image must agree on the number of cascades");
+
+/// Fraction of a cascade's far distance over which it blends into the next one.
+/// Must equal CASCADE_BLEND in mesh.frag. Each cascade also covers that band
+/// of the cascade before it, since that is where the shader reads it.
+constexpr float kCascadeBlend = 0.1f;
+
+/// Near plane of a spot light's shadow projection. Must equal SPOT_NEAR in mesh.frag.
+constexpr float kSpotNear = 0.1f;
+
+/// How much the cascade splits follow a logarithmic spacing (1) instead of an
+/// even one (0). Logarithmic puts more of the maps near the camera, where
+/// detail is seen; even gives the far cascades more.
+constexpr float kSplitLambda = 0.75f;
+
 /// View matrix of one face of a point light's shadow cube.
 ///
 /// The axes are the ones the Vulkan specification gives for each cube-map
@@ -42,6 +58,55 @@ glm::mat4 cubeFaceView(uint32_t face, const glm::vec3& position) {
     return rotation * glm::translate(glm::mat4(1.0f), -position);
 }
 
+/// View-projection of one cascade of the sun's shadow.
+///
+/// The cascade covers a sphere around its slice of the camera's view, so the
+/// size of its map does not change when the camera turns: a box that followed
+/// the slice's shape would grow and shrink, and every shadow edge would
+/// shimmer. For the same reason the centre is moved to a multiple of one
+/// texel in the light's own axes, so that a shadow edge always falls on the
+/// same texels while the camera moves.
+///
+/// The light's eye is pulled back towards the light until it reaches the
+/// nearest shadow caster, even one that lies outside the slice: a tree beyond
+/// the edge of the view still shadows what is inside it.
+///
+/// @param direction     Unit vector the light travels along.
+/// @param center        Centre of the sphere around the slice.
+/// @param radius        Radius of that sphere.
+/// @param casterCenter  Centre of a sphere around every shadow caster.
+/// @param casterRadius  Radius of that sphere.
+/// @param resolution    Width of the map in texels.
+/// @param[out] outDepthRange  Depth the map covers, from the eye to its far plane.
+glm::mat4 cascadeViewProjection(const glm::vec3& direction,
+                                glm::vec3 center, float radius,
+                                const glm::vec3& casterCenter, float casterRadius,
+                                float resolution, float& outDepthRange) {
+    const glm::vec3 up = std::abs(direction.y) > 0.99f ? glm::vec3(0.0f, 0.0f, 1.0f)
+                                                       : glm::vec3(0.0f, 1.0f, 0.0f);
+
+    // The light's axes, as a rotation with no position.
+    const glm::mat3 rotation = glm::mat3(glm::lookAt(glm::vec3(0.0f), direction, up));
+
+    // Snap the centre to the texel grid. The depth axis is left alone.
+    const float texel = 2.0f * radius / resolution;
+    glm::vec3 inLight = rotation * center;
+    inLight.x = std::floor(inLight.x / texel) * texel;
+    inLight.y = std::floor(inLight.y / texel) * texel;
+    center = glm::transpose(rotation) * inLight;    // a rotation's inverse is its transpose
+
+    // Distances along the light's direction: the slice, and the casters.
+    const float sliceMid  = glm::dot(center, direction);
+    const float casterMid = glm::dot(casterCenter, direction);
+    const float nearest   = std::min(sliceMid - radius, casterMid - casterRadius);
+    const float farthest  = sliceMid + radius;
+
+    const glm::vec3 eye = center + direction * (nearest - sliceMid);
+    outDepthRange = farthest - nearest;
+    return glm::ortho(-radius, radius, -radius, radius, 0.0f, farthest - nearest)
+         * glm::lookAt(eye, eye + direction, up);
+}
+
 } // namespace
 
 bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
@@ -50,23 +115,27 @@ bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
     // The shadow map comes before the uniforms (their descriptor sets point
     // at it), and the uniforms before the pipeline (its layout is built from
     // their descriptor set layout).
-    std::array<VkImageView, kMaxShadowCasters> views{};
-    std::array<VkSampler,   kMaxShadowCasters> samplers{};
+    ShadowBindings shadows;
     for (uint32_t i = 0; i < kMaxShadowCasters; ++i) {
         if (!m_shadowMaps[i].init(ctx)) return false;
-        views[i]    = m_shadowMaps[i].view();
-        samplers[i] = m_shadowMaps[i].sampler();
+        shadows.mapViews[i]         = m_shadowMaps[i].view();
+        shadows.mapSamplers[i]      = m_shadowMaps[i].sampler();
+        shadows.mapDepthSamplers[i] = m_shadowMaps[i].depthSampler();
     }
 
-    std::array<VkImageView, kMaxPointShadowCasters> cubeViews{};
-    std::array<VkSampler,   kMaxPointShadowCasters> cubeSamplers{};
     for (uint32_t i = 0; i < kMaxPointShadowCasters; ++i) {
         if (!m_shadowCubes[i].init(ctx)) return false;
-        cubeViews[i]    = m_shadowCubes[i].view();
-        cubeSamplers[i] = m_shadowCubes[i].sampler();
+        shadows.cubeViews[i]         = m_shadowCubes[i].view();
+        shadows.cubeSamplers[i]      = m_shadowCubes[i].sampler();
+        shadows.cubeDepthSamplers[i] = m_shadowCubes[i].depthSampler();
     }
 
-    if (!m_uniforms.init(ctx, views, samplers, cubeViews, cubeSamplers)) return false;
+    if (!m_shadowCascades.init(ctx)) return false;
+    shadows.cascadeView         = m_shadowCascades.view();
+    shadows.cascadeSampler      = m_shadowCascades.sampler();
+    shadows.cascadeDepthSampler = m_shadowCascades.depthSampler();
+
+    if (!m_uniforms.init(ctx, shadows)) return false;
 
     if (!m_shadowPipeline.init(ctx, ShadowMap::kFormat, shaderDir)) return false;
 
@@ -83,6 +152,7 @@ void SceneRenderer::shutdown() {
     m_uniforms.shutdown();
     for (ShadowMap& map : m_shadowMaps) map.shutdown();
     for (ShadowCube& cube : m_shadowCubes) cube.shutdown();
+    m_shadowCascades.shutdown();
     m_meshes.shutdown();
 }
 
@@ -96,9 +166,15 @@ void SceneRenderer::prepare(const Scene& scene) {
 
 SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
     SceneUniformData data;
+
+    // The scene's ambient light: the same on every surface, from every direction.
+    const SceneSettings& settings = scene.settings();
+    data.ambientColor = glm::vec4(settings.ambientColor * std::max(settings.ambientIntensity, 0.0f), 0.0f);
+
     int count = 0;
     uint32_t nextShadowSlot = 0;       // flat maps: directional and spot lights
     uint32_t nextCubeSlot   = 0;       // shadow cubes: point lights
+    bool     cascadeTaken   = false;   // the sun's cascades: the first directional light that casts
 
     auto lights = scene.registry().view<const LightComponent, const WorldTransform>();
     for (auto [entity, light, world] : lights.each()) {
@@ -122,7 +198,16 @@ SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
 
         GpuLight& out = data.lights[count];
         out.positionRange = glm::vec4(glm::vec3(world.matrix[3]), light.range);
-        out.direction     = glm::vec4(travel, 0.0f);
+
+        // The size of the light, which sets how wide its shadows' soft edges
+        // grow. A point or spot light's size is a radius in world units. The
+        // sun's is an angle, and what the shader needs is its tangent: how many
+        // units of blur each unit of distance from the blocker adds.
+        const float softness = std::max(light.shadowSoftness, 0.0f);
+        const float size = (light.type == LightComponent::Type::Directional)
+                         ? std::tan(glm::radians(std::min(softness, 45.0f)))
+                         : softness;
+        out.direction     = glm::vec4(travel, size);
 
         const glm::vec3 color = glm::vec3(light.color) * light.intensity;
 
@@ -152,7 +237,14 @@ SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
 
         // A light that asks for it gets a shadow map of its own kind, while
         // there are some left: a cube for a point light, a flat map otherwise.
-        if (light.castShadows) {
+        // The first directional light that casts shadows gets the cascades,
+        // which suit a light that lights the whole scene. Further directional
+        // lights fall back to a flat map like the spot lights.
+        if (light.castShadows && light.type == LightComponent::Type::Directional && !cascadeTaken) {
+            cascadeTaken   = true;
+            out.spotCone.z = 0.0f;
+            out.spotCone.w = 1.0f;
+        } else if (light.castShadows) {
             const bool isPoint = light.type == LightComponent::Type::Point;
             uint32_t&      next  = isPoint ? nextCubeSlot : nextShadowSlot;
             const uint32_t limit = isPoint ? kMaxPointShadowCasters : kMaxShadowCasters;
@@ -184,10 +276,7 @@ SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
     return data;
 }
 
-bool SceneRenderer::fitDirectionalShadow(const Scene& scene,
-                                         const glm::vec3& lightDirection,
-                                         glm::mat4& outViewProj,
-                                         float& outRadius) const {
+bool SceneRenderer::casterSphere(const Scene& scene, glm::vec3& outCenter, float& outRadius) const {
     // World-space box around every shadow caster.
     glm::vec3 lo( std::numeric_limits<float>::max());
     glm::vec3 hi(-std::numeric_limits<float>::max());
@@ -213,10 +302,20 @@ bool SceneRenderer::fitDirectionalShadow(const Scene& scene,
     if (!any) return false;
 
     // A sphere around that box. A sphere looks the same from every direction,
-    // so the map covers the casters however the light is turned. The margin
-    // keeps geometry that touches the sphere from being clipped.
-    const glm::vec3 center = 0.5f * (lo + hi);
-    const float     radius = std::max(0.5f * glm::length(hi - lo), 0.5f) * 1.05f;
+    // so a map fitted to it covers the casters however the light is turned.
+    // The margin keeps geometry that touches the sphere from being clipped.
+    outCenter = 0.5f * (lo + hi);
+    outRadius = std::max(0.5f * glm::length(hi - lo), 0.5f) * 1.05f;
+    return true;
+}
+
+bool SceneRenderer::fitDirectionalShadow(const Scene& scene,
+                                         const glm::vec3& lightDirection,
+                                         glm::mat4& outViewProj,
+                                         float& outRadius) const {
+    glm::vec3 center;
+    float     radius;
+    if (!casterSphere(scene, center, radius)) return false;
 
     // The light looks at the sphere's centre from one radius away. It needs
     // an "up" that is not parallel to its direction.
@@ -251,7 +350,9 @@ void SceneRenderer::drawShadowCasters(VkCommandBuffer cmd, const Scene& scene,
 
 void SceneRenderer::renderShadows(VkCommandBuffer cmd,
                                   const Scene& scene,
-                                  uint32_t frameIndex) {
+                                  uint32_t frameIndex,
+                                  const glm::mat4& cameraView,
+                                  const glm::mat4& cameraProjection) {
     SceneUniformData data = gatherLights(scene);
 
     // Which light owns each shadow map, found from the slot gatherLights()
@@ -263,7 +364,7 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
     for (int& l : cubeLight) l = -1;
     for (int i = 0; i < data.lightCount.x; ++i) {
         const int slot = static_cast<int>(data.lights[i].spotCone.z);
-        if (slot < 0) continue;
+        if (slot < 0 || data.lights[i].spotCone.w > 0.5f) continue;   // none, or cascaded
         if (data.lights[i].colorType.w == kGpuLightPoint) cubeLight[slot] = i;
         else                                              slotLight[slot] = i;
     }
@@ -287,7 +388,7 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
                 // light's range: nothing beyond it is lit anyway.
                 const float outer = std::acos(std::clamp(light.spotCone.x, -1.0f, 1.0f));
                 const float fov   = std::min(2.0f * outer + glm::radians(2.0f), glm::radians(170.0f));
-                const float nearPlane = 0.1f;
+                const float nearPlane = kSpotNear;
                 const float farPlane  = std::max(light.positionRange.w, nearPlane + 0.1f);
 
                 const glm::vec3 position = glm::vec3(light.positionRange);
@@ -300,14 +401,15 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
                 // One texel covers 2 * tan(fov / 2) / resolution world units per
                 // unit of distance to the light.
                 const float texelPerDistance = 2.0f * std::tan(0.5f * fov) / resolution;
-                data.shadowParams[slot] = glm::vec4(1.0f / resolution, 1.5f * texelPerDistance, 1.0f, 0.0f);
+                data.shadowParams[slot] = glm::vec4(texelPerDistance, 1.5f * texelPerDistance, 1.0f, farPlane);
             } else {
                 float radius = 0.0f;
                 if (fitDirectionalShadow(scene, direction, lightViewProj, radius)) {
                     casting = true;
 
                     const float texelWorld = 2.0f * radius / resolution;   // one texel, in world units
-                    data.shadowParams[slot] = glm::vec4(1.0f / resolution, 1.5f * texelWorld, 0.0f, 0.0f);
+                    data.shadowParams[slot] = glm::vec4(texelWorld, 1.5f * texelWorld, 0.0f,
+                                                        2.0f * radius);   // far plane of the box
                 } else {
                     light.spotCone.z = -1.0f;   // nothing to cast: the shader skips the lookup
                 }
@@ -319,6 +421,103 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
         if (casting) drawShadowCasters(cmd, scene, lightViewProj);
         m_shadowMaps[slot].end(cmd);
     }
+
+    // ---- The sun's cascades ----
+    // What the camera sees, from its matrices: where it is, where it looks,
+    // how wide its view is, and its near and far planes (read back from the
+    // two numbers a perspective projection keeps for depth).
+    const glm::mat4 cameraWorld = glm::inverse(cameraView);
+    const glm::vec3 cameraPos   = glm::vec3(cameraWorld[3]);
+    const glm::vec3 forward     = -glm::normalize(glm::vec3(cameraWorld[2]));
+    data.cameraForward = glm::vec4(forward, -glm::dot(forward, cameraPos));
+
+    const float p22 = cameraProjection[2][2];
+    const float p32 = cameraProjection[3][2];
+    const bool  perspective = cameraProjection[2][3] == -1.0f && std::abs(p22) > 1e-6f;
+    const float camNear = perspective ? p32 / p22 : 0.0f;
+    const float camFar  = perspective ? p32 / (p22 + 1.0f) : 0.0f;
+    const bool  cameraOk = perspective && camNear > 0.0f && camFar > camNear
+                        && std::abs(cameraProjection[0][0]) > 1e-6f
+                        && std::abs(cameraProjection[1][1]) > 1e-6f;
+
+    int cascadeLight = -1;
+    for (int i = 0; i < data.lightCount.x; ++i)
+        if (data.lights[i].spotCone.w > 0.5f) cascadeLight = i;
+
+    // Splits: a blend of an even and a logarithmic spacing between the near
+    // plane and the shadow distance (or the far plane, if that is nearer).
+    float splits[kShadowCascades] = {};
+    glm::vec3 casterCenter(0.0f);
+    float     casterRadius = 0.0f;
+    bool      cascadesCast = false;
+
+    if (cascadeLight >= 0) {
+        cascadesCast = cameraOk && casterSphere(scene, casterCenter, casterRadius);
+        if (!cascadesCast) {
+            // Nothing to cast, or no usable camera: the shader skips the lookup.
+            data.lights[cascadeLight].spotCone.z = -1.0f;
+            data.lights[cascadeLight].spotCone.w = 0.0f;
+        }
+    }
+
+    if (cascadesCast) {
+        const float shadowFar = std::min(camFar, kShadowDistance);
+        for (uint32_t i = 0; i < kShadowCascades; ++i) {
+            const float t       = static_cast<float>(i + 1) / static_cast<float>(kShadowCascades);
+            const float uniform = camNear + (shadowFar - camNear) * t;
+            const float logarithmic = camNear * std::pow(shadowFar / camNear, t);
+            splits[i] = glm::mix(uniform, logarithmic, kSplitLambda);
+        }
+        splits[kShadowCascades - 1] = shadowFar;
+    }
+    data.cascadeSplits = glm::vec4(splits[0], splits[1], splits[2], splits[3]);
+
+    const float tanX = cameraOk ? 1.0f / std::abs(cameraProjection[0][0]) : 0.0f;
+    const float tanY = cameraOk ? 1.0f / std::abs(cameraProjection[1][1]) : 0.0f;
+    const float cascadeResolution = static_cast<float>(ShadowCascades::kResolution);
+
+    m_shadowCascades.begin(cmd);
+    for (uint32_t i = 0; i < kShadowCascades; ++i) {
+        glm::mat4 lightViewProj{1.0f};
+
+        if (cascadesCast) {
+            // The slice of the view this cascade covers: from the end of the
+            // previous one (a little earlier, where that one blends into this
+            // one) to its own end.
+            const float sliceNear = (i == 0) ? camNear : splits[i - 1] * (1.0f - kCascadeBlend);
+            const float sliceFar  = splits[i];
+
+            // Its eight corners, from the view's width at each distance.
+            glm::vec3 centre(0.0f);
+            glm::vec3 corners[8];
+            for (int c = 0; c < 8; ++c) {
+                const float d = (c & 4) ? sliceFar : sliceNear;
+                const glm::vec4 inView((c & 1) ? d * tanX : -d * tanX,
+                                       (c & 2) ? d * tanY : -d * tanY, -d, 1.0f);
+                corners[c] = glm::vec3(cameraWorld * inView);
+                centre += corners[c] * 0.125f;
+            }
+            float radius = 0.0f;
+            for (const glm::vec3& corner : corners)
+                radius = std::max(radius, glm::length(corner - centre));
+            radius = std::ceil(radius * 16.0f) / 16.0f;   // a little steadier when the view changes
+
+            float depthRange = 0.0f;
+            lightViewProj = cascadeViewProjection(glm::vec3(data.lights[cascadeLight].direction),
+                                                  centre, radius, casterCenter, casterRadius,
+                                                  cascadeResolution, depthRange);
+
+            const float texelWorld = 2.0f * radius / cascadeResolution;
+            data.cascadeParams[i] = glm::vec4(texelWorld, 1.5f * texelWorld, 0.0f, depthRange);
+        }
+        data.cascadeViewProj[i] = lightViewProj;
+
+        // As with the other maps, every cascade is begun and ended every frame.
+        m_shadowCascades.beginCascade(cmd, i);
+        if (cascadesCast) drawShadowCasters(cmd, scene, lightViewProj);
+        m_shadowCascades.endCascade(cmd);
+    }
+    m_shadowCascades.end(cmd);
 
     // ---- Point lights: six views per light, one cube each ----
     // Every face has a 90 degree field of view, so six of them cover the whole

@@ -87,6 +87,11 @@ public:
     /// @return Comparison sampler (see ShadowMap::sampler()).
     VkSampler sampler() const { return m_sampler; }
 
+    /// @return Plain nearest-neighbour sampler over the same depth image. It
+    ///         returns the stored depth itself instead of a lit / shadowed
+    ///         answer, which the shadow filter needs to find blockers.
+    VkSampler depthSampler() const { return m_depthSampler; }
+
 private:
     void barrier(VkCommandBuffer cmd, VkImageLayout from, VkImageLayout to,
                  VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
@@ -100,6 +105,7 @@ private:
     VkImageView m_cubeView = VK_NULL_HANDLE;                  ///< All six faces, for sampling.
     std::array<VkImageView, kFaces> m_faceViews{};            ///< One face each, for drawing.
     VkSampler   m_sampler  = VK_NULL_HANDLE;
+    VkSampler     m_depthSampler = VK_NULL_HANDLE;
 };
 
 } // namespace fe

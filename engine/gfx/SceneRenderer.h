@@ -9,6 +9,7 @@
 #include "gfx/MeshLibrary.h"
 #include "gfx/MeshPipeline.h"
 #include "gfx/SceneUniforms.h"
+#include "gfx/ShadowCascades.h"
 #include "gfx/ShadowCube.h"
 #include "gfx/ShadowMap.h"
 #include "gfx/ShadowPipeline.h"
@@ -53,8 +54,12 @@ class VulkanContext;
  * found. Every MeshRenderer with castShadows set is drawn from the light's
  * point of view into its shadow map, and the main pass darkens what the map
  * says is hidden from the light.
- *   - A directional light's map covers a box that fits all the casters in the
- *     scene, so it gets less sharp as the scene grows.
+ *   - The first directional light that casts shadows (normally the sun) uses
+ *     cascaded shadow maps: the camera's view is cut by distance into
+ *     kShadowCascades slices up to kShadowDistance, each with a map of its
+ *     own, so shadows stay sharp near the camera whatever the size of the
+ *     scene. Any further directional light gets one map fitted to all the
+ *     casters, which gets less sharp as the scene grows.
  *   - A spot light's map covers its cone, up to its range.
  *   - A point light needs six maps, one per direction (a cube), and covers
  *     everything within its range.
@@ -66,6 +71,11 @@ class VulkanContext;
  */
 class SceneRenderer {
 public:
+    /// How far from the camera the sun's shadows reach, in world units. Beyond
+    /// it surfaces are lit with no shadow. Farther means each cascade is
+    /// stretched over more ground and so is less sharp.
+    static constexpr float kShadowDistance = 60.0f;
+
     /**
      * @brief Creates the pipeline, the scene uniforms and the built-in meshes.
      *
@@ -98,11 +108,17 @@ public:
      * The pass runs even when nothing casts shadows: the map is simply
      * cleared, which keeps its layout valid for the shader.
      *
-     * @param cmd        Command buffer from Renderer::currentCommandBuffer().
-     * @param scene      Scene to draw.
-     * @param frameIndex Renderer::currentFrameIndex().
+     * @param cmd              Command buffer from Renderer::currentCommandBuffer().
+     * @param scene            Scene to draw.
+     * @param frameIndex       Renderer::currentFrameIndex().
+     * @param cameraView       View matrix of the camera that will render the scene.
+     * @param cameraProjection Its perspective projection (Vulkan depth range, as
+     *                         the cameras produce). The sun's cascades follow
+     *                         what this camera sees; with any other projection
+     *                         the sun casts no shadows.
      */
-    void renderShadows(VkCommandBuffer cmd, const Scene& scene, uint32_t frameIndex);
+    void renderShadows(VkCommandBuffer cmd, const Scene& scene, uint32_t frameIndex,
+                       const glm::mat4& cameraView, const glm::mat4& cameraProjection);
 
     /**
      * @brief Records the draw calls for every renderable entity.
@@ -146,6 +162,10 @@ private:
     /// gives each shadow-casting light a shadow map slot (GpuLight::spotCone.z).
     static SceneUniformData gatherLights(const Scene& scene);
 
+    /// Finds a sphere around every shadow caster in the scene.
+    /// @return `false` if there is no caster.
+    bool casterSphere(const Scene& scene, glm::vec3& outCenter, float& outRadius) const;
+
     /// Builds the view-projection of a directional shadow light so that it
     /// covers every shadow caster. @return `false` if there is no caster.
     bool fitDirectionalShadow(const Scene& scene, const glm::vec3& lightDirection,
@@ -157,6 +177,7 @@ private:
 
     std::array<ShadowMap,  kMaxShadowCasters>      m_shadowMaps;
     std::array<ShadowCube, kMaxPointShadowCasters> m_shadowCubes;
+    ShadowCascades m_shadowCascades;
     ShadowPipeline m_shadowPipeline;
     SceneUniforms  m_uniforms;
     MeshPipeline   m_pipeline;

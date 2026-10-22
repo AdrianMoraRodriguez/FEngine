@@ -3,6 +3,9 @@
 #include "scene/ComponentRegistry.h"
 
 #include <imgui.h>
+#include <glm/gtc/type_ptr.hpp>
+
+#include <algorithm>
 
 namespace fe {
 
@@ -11,7 +14,18 @@ void InspectorPanel::onImGui() {
 
     if (m_selected == entt::null ||
         !m_scene.registry().valid(m_selected)) {
+        // With nothing selected, the Inspector shows the scene's own settings.
         ImGui::TextDisabled("No entity selected.");
+        ImGui::Separator();
+
+        if (ImGui::CollapsingHeader("Scene Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+            SceneSettings& settings = m_scene.settings();
+            ImGui::ColorEdit3("Ambient Colour", glm::value_ptr(settings.ambientColor));
+            ImGui::DragFloat("Ambient Intensity", &settings.ambientIntensity,
+                             0.005f, 0.0f, 5.0f, "%.3f");
+            settings.ambientIntensity = std::max(settings.ambientIntensity, 0.0f);
+        }
+
         ImGui::End();
         return;
     }

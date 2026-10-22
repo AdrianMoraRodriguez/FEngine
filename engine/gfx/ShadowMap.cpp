@@ -76,6 +76,25 @@ bool ShadowMap::init(const VulkanContext& ctx) {
         return false;
     }
 
+    // The same image read as plain depth values, for the shadow filter's
+    // search for blockers. Nearest filtering: depths must not be blended.
+    VkSamplerCreateInfo depthSamplerInfo{};
+    depthSamplerInfo.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    depthSamplerInfo.magFilter    = VK_FILTER_NEAREST;
+    depthSamplerInfo.minFilter    = VK_FILTER_NEAREST;
+    depthSamplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    depthSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    depthSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    depthSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    depthSamplerInfo.borderColor  = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    depthSamplerInfo.maxLod       = 0.0f;
+
+    if (vkCreateSampler(ctx.device(), &depthSamplerInfo, nullptr, &m_depthSampler) != VK_SUCCESS) {
+        FE_ERROR("ShadowMap: failed to create the depth sampler");
+        shutdown();
+        return false;
+    }
+
     FE_INFO("ShadowMap: created (%ux%u)", kResolution, kResolution);
     return true;
 }
@@ -83,6 +102,8 @@ bool ShadowMap::init(const VulkanContext& ctx) {
 void ShadowMap::shutdown() {
     if (!m_ctx) return;
 
+    if (m_depthSampler != VK_NULL_HANDLE)
+        vkDestroySampler(m_ctx->device(), m_depthSampler, nullptr);
     if (m_sampler != VK_NULL_HANDLE)
         vkDestroySampler(m_ctx->device(), m_sampler, nullptr);
     if (m_view != VK_NULL_HANDLE)
@@ -91,6 +112,7 @@ void ShadowMap::shutdown() {
         vmaDestroyImage(m_ctx->allocator(), m_image, m_allocation);
 
     m_sampler    = VK_NULL_HANDLE;
+    m_depthSampler = VK_NULL_HANDLE;
     m_view       = VK_NULL_HANDLE;
     m_image      = VK_NULL_HANDLE;
     m_allocation = VK_NULL_HANDLE;

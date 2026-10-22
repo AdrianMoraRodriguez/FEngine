@@ -83,6 +83,24 @@ bool ShadowCube::init(const VulkanContext& ctx) {
         return false;
     }
 
+    // The same image read as plain depth values, for the shadow filter's
+    // search for blockers. Nearest filtering: depths must not be blended.
+    VkSamplerCreateInfo depthSamplerInfo{};
+    depthSamplerInfo.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    depthSamplerInfo.magFilter    = VK_FILTER_NEAREST;
+    depthSamplerInfo.minFilter    = VK_FILTER_NEAREST;
+    depthSamplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    depthSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    depthSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    depthSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    depthSamplerInfo.maxLod       = 0.0f;
+
+    if (vkCreateSampler(ctx.device(), &depthSamplerInfo, nullptr, &m_depthSampler) != VK_SUCCESS) {
+        FE_ERROR("ShadowCube: failed to create the depth sampler");
+        shutdown();
+        return false;
+    }
+
     FE_INFO("ShadowCube: created (6 x %ux%u)", kResolution, kResolution);
     return true;
 }
@@ -90,6 +108,8 @@ bool ShadowCube::init(const VulkanContext& ctx) {
 void ShadowCube::shutdown() {
     if (!m_ctx) return;
 
+    if (m_depthSampler != VK_NULL_HANDLE)
+        vkDestroySampler(m_ctx->device(), m_depthSampler, nullptr);
     if (m_sampler != VK_NULL_HANDLE)
         vkDestroySampler(m_ctx->device(), m_sampler, nullptr);
     for (VkImageView& v : m_faceViews) {
@@ -102,6 +122,7 @@ void ShadowCube::shutdown() {
         vmaDestroyImage(m_ctx->allocator(), m_image, m_allocation);
 
     m_sampler    = VK_NULL_HANDLE;
+    m_depthSampler = VK_NULL_HANDLE;
     m_cubeView   = VK_NULL_HANDLE;
     m_image      = VK_NULL_HANDLE;
     m_allocation = VK_NULL_HANDLE;

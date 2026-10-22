@@ -14,6 +14,25 @@
 namespace fe {
 
 /**
+ * @brief Settings that belong to the scene as a whole, not to any entity.
+ *
+ * Saved in the scene file. Edited in the Inspector while no entity is selected.
+ */
+struct SceneSettings {
+    /// Colour of the ambient light: the light that reaches every surface from
+    /// every direction, so that what no light shines on is not pitch black.
+    glm::vec3 ambientColor{1.0f};
+
+    /// Brightness of the ambient light. The ambient light's final colour is
+    /// ambientColor * ambientIntensity.
+    float ambientIntensity = 0.25f;
+};
+
+// The WITH_DEFAULT variant fills in any key the file does not have, so a scene
+// file saved before a setting existed still loads.
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SceneSettings, ambientColor, ambientIntensity)
+
+/**
  * @brief A scene: a collection of entities with components.
  *
  * The scene owns an entt::registry and maintains a hierarchy of entities
@@ -155,6 +174,12 @@ public:
     /// @brief Sets the display name of this scene.
     void setName(std::string n) { m_name = std::move(n); }
 
+    /// @return The scene-wide settings (ambient light, ...).
+    SceneSettings& settings() { return m_settings; }
+
+    /// @return The scene-wide settings (ambient light, ...).
+    const SceneSettings& settings() const { return m_settings; }
+
 private:
     void attach(entt::entity child, entt::entity parent);
     void detach(entt::entity e);
@@ -167,6 +192,7 @@ private:
 
     std::unordered_map<UUID, entt::entity> m_byUUID;
     std::string m_name = "Untitled";
+    SceneSettings m_settings;
 };
 
 } // namespace fe

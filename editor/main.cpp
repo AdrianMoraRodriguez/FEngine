@@ -268,6 +268,7 @@ int main() {
         fe::LightComponent light;
         light.type      = fe::LightComponent::Type::Directional;
         light.intensity = 0.75f;   // matches the default light's brightness
+        light.shadowSoftness = 1.5f;   // the sun's angular radius, in degrees
         scene.registry().emplace<fe::LightComponent>(sun, light);
         scene.transform(sun).position = {0.0f, 6.0f, 0.0f};
         scene.transform(sun).rotation = glm::rotation(
@@ -361,16 +362,22 @@ int main() {
 
         VkCommandBuffer cmd = renderer.currentCommandBuffer();
 
-        // 1. Shadow pass: the scene seen from the sun, depth only. It also
+        // The camera is needed twice: the sun's shadow cascades follow what it
+        // sees, and the scene pass is drawn through it.
+        const float aspect = static_cast<float>(offscreen.width()) /
+                             static_cast<float>(offscreen.height());
+        const glm::mat4 cameraView       = editorCamera.view();
+        const glm::mat4 cameraProjection = editorCamera.projection(aspect);
+
+        // 1. Shadow pass: the scene seen from each light, depth only. It also
         //    uploads this frame's lights, so it comes before the scene pass.
-        sceneRenderer.renderShadows(cmd, scene, renderer.currentFrameIndex());
+        sceneRenderer.renderShadows(cmd, scene, renderer.currentFrameIndex(),
+                                    cameraView, cameraProjection);
 
         // 2. Scene pass: draw the scene into the offscreen buffer.
         fe::Renderer::beginOffscreenPass(cmd, offscreen);
 
-        const float aspect = static_cast<float>(offscreen.width()) /
-                             static_cast<float>(offscreen.height());
-        const glm::mat4 viewProj = editorCamera.projection(aspect) * editorCamera.view();
+        const glm::mat4 viewProj = cameraProjection * cameraView;
 
         // The frame index picks this frame slot's copy of the scene's lights.
         sceneRenderer.render(cmd, scene, viewProj,

@@ -34,6 +34,9 @@ constexpr uint32_t kMaxShadowCasters = 4;
 /// whole cube of six shadow maps (see ShadowCube), so this is kept small.
 constexpr uint32_t kMaxPointShadowCasters = 2;
 
+/// Number of cascades of the sun's cascaded shadow map (see ShadowCascades).
+constexpr uint32_t kShadowCascades = 4;
+
 /// Values of GpuLight::colorType.w.
 constexpr float kGpuLightDirectional = 0.0f;
 constexpr float kGpuLightPoint       = 1.0f;
@@ -52,7 +55,10 @@ struct GpuLight {
     /// rgb: colour already multiplied by the intensity. w: the light type (kGpuLight*).
     glm::vec4 colorType{0.0f};
 
-    /// xyz: direction the light travels (directional and spot). w: unused.
+    /// xyz: direction the light travels (directional and spot).
+    /// w: size of the light, which sets how wide the soft edge of its shadows
+    ///    grows: a radius in world units for point and spot lights, and for a
+    ///    directional light the tangent of its angular radius.
     glm::vec4 direction{0.0f, -1.0f, 0.0f, 0.0f};
 
     /// x: spot only, cosine of the outer half-angle (where the light is gone).
@@ -61,7 +67,8 @@ struct GpuLight {
     /// z: which shadow map this light uses, or -1 if it casts no shadows. A
     ///    point light counts in its own list of cubes (0 .. kMaxPointShadowCasters - 1);
     ///    directional and spot lights in the list of flat maps (0 .. kMaxShadowCasters - 1).
-    /// w: unused.
+    /// w: 1 for the one directional light whose shadows are cascaded (it then
+    ///    uses the cascades instead of a flat map, and z is 0), else 0.
     glm::vec4 spotCone{0.0f, 0.0f, -1.0f, 0.0f};
 };
 
@@ -83,12 +90,12 @@ struct SceneUniformData {
     glm::mat4 shadowViewProj[kMaxShadowCasters];
 
     /// For each shadow map.
-    /// x: size of one texel in texture coordinates (1 / resolution).
-    /// y: how far the shadow lookup is pushed along the surface normal, in
-    ///    world units (directional) or in world units per unit of distance
-    ///    to the light (spot).
-    /// z: 1 if y must be multiplied by the distance to the light, else 0.
-    /// w: unused.
+    /// x: size of one texel in world units (per unit of distance to the light if z is 1).
+    /// y: how far the shadow lookup is pushed along the surface normal, same units as x.
+    /// z: 1 if the map is a perspective view (spot light), whose x and y must be
+    ///    multiplied by the distance to the light; 0 if orthographic (directional).
+    /// w: far plane of the map's projection. Its near plane is a constant
+    ///    (0 when orthographic, kSpotNear for a spot light).
     glm::vec4 shadowParams[kMaxShadowCasters];
 
     /// For the point lights' shadow cubes, which all share these values.
@@ -98,6 +105,20 @@ struct SceneUniformData {
     glm::vec4 pointShadowParams{0.0f};
 
     GpuLight lights[kMaxLights];
+
+    /// For each cascade of the sun's shadow: world space -> that cascade's clip space.
+    glm::mat4 cascadeViewProj[kShadowCascades];
+
+    /// For each cascade, same meaning as shadowParams (z is always 0: orthographic).
+    glm::vec4 cascadeParams[kShadowCascades];
+
+    /// Distance from the camera, along its view direction, at which each
+    /// cascade ends. Beyond the last one there are no shadows.
+    glm::vec4 cascadeSplits{0.0f};
+
+    /// xyz: the direction the camera looks along. w: such that
+    /// dot(xyz, point) + w is the point's distance in front of the camera.
+    glm::vec4 cameraForward{0.0f, 0.0f, -1.0f, 0.0f};
 };
 
 static_assert(sizeof(GpuLight) == 64,
@@ -110,8 +131,35 @@ static_assert(offsetof(SceneUniformData, pointShadowParams) == 32 + 80 * kMaxSha
               "The cube shadow parameters must follow the flat shadow data");
 static_assert(offsetof(SceneUniformData, lights) == 48 + 80 * kMaxShadowCasters,
               "The light array must start after the shadow data");
-static_assert(sizeof(SceneUniformData) == 48 + 80 * kMaxShadowCasters + 64 * kMaxLights,
+static_assert(offsetof(SceneUniformData, cascadeViewProj) == 48 + 80 * kMaxShadowCasters + 64 * kMaxLights,
+              "The cascade data must follow the light array");
+static_assert(offsetof(SceneUniformData, cameraForward) ==
+              48 + 80 * kMaxShadowCasters + 64 * kMaxLights + 80 * kShadowCascades + 16,
+              "The camera data must follow the cascade data");
+static_assert(sizeof(SceneUniformData) ==
+              48 + 80 * kMaxShadowCasters + 64 * kMaxLights + 80 * kShadowCascades + 32,
               "SceneUniformData must match the std140 block in mesh.frag");
+
+/**
+ * @brief The shadow images the scene shader reads, as handed to SceneUniforms::init().
+ *
+ * Every image is read twice: through a comparison sampler, which answers
+ * "lit or shadowed" for a reference depth, and through a plain sampler, which
+ * returns the stored depth (to find what blocks the light).
+ */
+struct ShadowBindings {
+    std::array<VkImageView, kMaxShadowCasters> mapViews{};            ///< ShadowMap::view() of each flat map.
+    std::array<VkSampler,   kMaxShadowCasters> mapSamplers{};         ///< ShadowMap::sampler().
+    std::array<VkSampler,   kMaxShadowCasters> mapDepthSamplers{};    ///< ShadowMap::depthSampler().
+
+    std::array<VkImageView, kMaxPointShadowCasters> cubeViews{};          ///< ShadowCube::view() of each cube.
+    std::array<VkSampler,   kMaxPointShadowCasters> cubeSamplers{};       ///< ShadowCube::sampler().
+    std::array<VkSampler,   kMaxPointShadowCasters> cubeDepthSamplers{};  ///< ShadowCube::depthSampler().
+
+    VkImageView cascadeView         = VK_NULL_HANDLE;   ///< ShadowCascades::view().
+    VkSampler   cascadeSampler      = VK_NULL_HANDLE;   ///< ShadowCascades::sampler().
+    VkSampler   cascadeDepthSampler = VK_NULL_HANDLE;   ///< ShadowCascades::depthSampler().
+};
 
 /**
  * @brief Owns the uniform buffers and the descriptor set that expose
@@ -143,23 +191,17 @@ public:
     /**
      * @brief Creates the descriptor layout, pool, buffers and sets.
      *
-     * Set 0 has three bindings: 0 is the uniform buffer with SceneUniformData,
-     * 1 is an array with the flat shadow maps and 2 an array with the shadow
-     * cubes. The shadow maps never change, so every set is pointed at them
-     * once, here.
+     * Set 0 has seven bindings: 0 is the uniform buffer with SceneUniformData;
+     * 1, 2 and 3 are the flat shadow maps, the shadow cubes and the sun's
+     * cascades, read through comparison samplers; 4, 5 and 6 are the same
+     * three, read through plain samplers for their raw depths. The shadow
+     * images never change, so every set is pointed at them once, here.
      *
-     * @param ctx            Initialised Vulkan context.
-     * @param shadowViews    View of each flat shadow map (ShadowMap::view()).
-     * @param shadowSamplers Comparison sampler of each (ShadowMap::sampler()).
-     * @param cubeViews      View of each shadow cube (ShadowCube::view()).
-     * @param cubeSamplers   Comparison sampler of each (ShadowCube::sampler()).
+     * @param ctx     Initialised Vulkan context.
+     * @param shadows The views and samplers of every shadow image.
      * @return `true` on success.
      */
-    bool init(const VulkanContext& ctx,
-              const std::array<VkImageView, kMaxShadowCasters>& shadowViews,
-              const std::array<VkSampler,   kMaxShadowCasters>& shadowSamplers,
-              const std::array<VkImageView, kMaxPointShadowCasters>& cubeViews,
-              const std::array<VkSampler,   kMaxPointShadowCasters>& cubeSamplers);
+    bool init(const VulkanContext& ctx, const ShadowBindings& shadows);
 
     /// Destroys everything. Safe to call more than once.
     void shutdown();

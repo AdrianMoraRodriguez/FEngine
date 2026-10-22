@@ -193,6 +193,15 @@ struct LightComponent {
     /// kMaxShadowCasters directional and spot lights and kMaxPointShadowCasters
     /// point lights that do.
     bool      castShadows = true;
+
+    /// Size of the light, which sets how soft the edges of its shadows are.
+    /// For a point or spot light it is the radius of the light itself, in
+    /// world units (a bulb is around 0.05 to 0.2). For a directional light it
+    /// is the angular radius in degrees (the real sun is about 0.27; larger
+    /// values give softer shadows). The edge is sharp where a shadow starts at
+    /// the object casting it and widens with the distance from it, and 0 gives
+    /// the sharpest edge the shadow map can draw.
+    float     shadowSoftness = 0.15f;
 };
 
 // ---------------------------------------------------------------------------
@@ -214,7 +223,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(CameraComponent, fovDegrees, nearPlane, farPl
 // saved before the cone angles were in degrees hold "innerCone" and
 // "outerCone" instead; they still load, with the default angles.
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(LightComponent, type, color, intensity, range,
-                                                innerConeDegrees, outerConeDegrees, castShadows)
+                                                innerConeDegrees, outerConeDegrees, castShadows,
+                                                shadowSoftness)
 
 // ---------------------------------------------------------------------------
 // Inspector forward declarations

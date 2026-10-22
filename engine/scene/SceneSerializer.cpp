@@ -47,6 +47,7 @@ std::string SceneSerializer::serialize(const Scene& scene) {
     json out;
     out["version"]  = 1;
     out["name"]     = scene.name();
+    out["settings"] = scene.settings();
     out["entities"] = json::array();
 
     const auto& reg = scene.registry();
@@ -102,6 +103,10 @@ bool SceneSerializer::loadFromFile(Scene& scene,
         }
 
         scene.setName(in.value("name", std::string{"Untitled"}));
+
+        // Scenes saved before the settings existed have no such key.
+        scene.settings() = in.contains("settings") ? in.at("settings").get<SceneSettings>()
+                                                   : SceneSettings{};
 
         // Entities are stored in depth-first order (parents before
         // children), so resolving the parent UUID always succeeds.

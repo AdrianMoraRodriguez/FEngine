@@ -86,6 +86,11 @@ public:
      */
     VkSampler sampler() const { return m_sampler; }
 
+    /// @return Plain nearest-neighbour sampler over the same depth image. It
+    ///         returns the stored depth itself instead of a lit / shadowed
+    ///         answer, which the shadow filter needs to find blockers.
+    VkSampler depthSampler() const { return m_depthSampler; }
+
 private:
     const VulkanContext* m_ctx = nullptr;
 
@@ -93,6 +98,7 @@ private:
     VmaAllocation m_allocation = VK_NULL_HANDLE;
     VkImageView   m_view       = VK_NULL_HANDLE;
     VkSampler     m_sampler    = VK_NULL_HANDLE;
+    VkSampler     m_depthSampler = VK_NULL_HANDLE;
 };
 
 } // namespace fe
