@@ -10,6 +10,7 @@ project(FEngine
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+enable_language(RC)
 
 # Salida de binarios
 # Todos los ejecutables al mismo sitio, para que las rutas relativas a

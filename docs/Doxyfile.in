@@ -1,4 +1,5 @@
-PROJECT_NAME           = "@PROJECT_NAME@"
+PROJECT_NAME = "Fractalis Engine"
+PROJECT_LOGO = @CMAKE_SOURCE_DIR@/branding/png/fractalis-icon-128.png
 PROJECT_NUMBER         = "@PROJECT_VERSION@"
 PROJECT_BRIEF          = "@PROJECT_DESCRIPTION@"
 

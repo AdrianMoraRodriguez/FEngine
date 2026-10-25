@@ -1,4 +1,12 @@
-# FEngine
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/fractalis-logo-for-dark-bg.png">
+    <source media="(prefers-color-scheme: light)" srcset="branding/fractalis-logo-for-light-bg.png">
+    <img alt="Fractalis Engine" src="branding/fractalis-logo-for-light-bg.png" width="420">
+  </picture>
+</p>
+
+# Fractalis Engine
 
 A 3D game engine with a scene editor, built from scratch in C++20 and Vulkan.
 

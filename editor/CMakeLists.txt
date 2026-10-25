@@ -10,3 +10,13 @@ find_package(imgui CONFIG REQUIRED)
 target_link_libraries(FEditor PRIVATE FEngine imgui::imgui)
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${EDITOR_SOURCES})
+
+if(WIN32)
+    target_sources(FEditor PRIVATE resources/fractalis.rc)
+endif()
+
+# Window icon PNGs, next to the executable.
+add_custom_command(TARGET FEditor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/branding/png"
+            "$<TARGET_FILE_DIR:FEditor>/branding")

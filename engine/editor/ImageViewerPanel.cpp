@@ -91,6 +91,9 @@ void ImageViewerPanel::release(Viewer& v) {
 }
 
 void ImageViewerPanel::shutdown() {
+    // The destructor calls this again after the Vulkan device is gone; with
+    // no viewers left there is nothing to do and the device is not touched.
+    if (m_viewers.empty()) return;
     for (auto& v : m_viewers) release(*v);
     m_viewers.clear();
 }

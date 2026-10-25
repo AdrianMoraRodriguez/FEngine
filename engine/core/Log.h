@@ -18,6 +18,7 @@
  */
 
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
 namespace fe {
@@ -36,10 +37,10 @@ enum class LogLevel {
 };
 
 /**
- * @brief Returns the fixed-width display name of a severity level.
+ * @brief Returns the display name of a severity level, between 4 and 5 characters.
  *
- * All returned names are padded to five characters so that log output
- * stays column-aligned.
+ * log() adds the padding after the closing bracket, so the brackets hug the
+ * name (`[INFO]`) and the messages still line up.
  *
  * @param level The severity to name.
  * @return A null-terminated string with static storage duration.
@@ -47,8 +48,8 @@ enum class LogLevel {
 inline const char* logLevelName(LogLevel level) {
     switch (level) {
         case LogLevel::Trace: return "TRACE";
-        case LogLevel::Info:  return "INFO ";
-        case LogLevel::Warn:  return "WARN ";
+        case LogLevel::Info:  return "INFO";
+        case LogLevel::Warn:  return "WARN";
         case LogLevel::Error: return "ERROR";
     }
     return "?????";
@@ -87,7 +88,11 @@ void log(LogLevel level, const char* format, Args... args) {
     std::FILE* stream =
         (level == LogLevel::Error || level == LogLevel::Warn) ? stderr : stdout;
 
-    std::fprintf(stream, "[%s] ", logLevelName(level));
+    // "[INFO]  text" / "[ERROR] text": the padding goes outside the brackets.
+    const char* name = logLevelName(level);
+    int pad = 5 - static_cast<int>(std::strlen(name));
+    if (pad < 0) pad = 0;
+    std::fprintf(stream, "[%s]%*s ", name, pad, "");
     std::fprintf(stream, format, args...);
     std::fprintf(stream, "\n");
     std::fflush(stream);

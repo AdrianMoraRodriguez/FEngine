@@ -17,6 +17,7 @@
 #include "scene/SceneSerializer.h"
 #include "editor/AssetBrowser.h"
 #include "editor/ImageThumbnails.h"
+#include "import/ImageLoader.h"
 #include "editor/ImageViewerPanel.h"
 #include "editor/FileDrop.h"
 #include "editor/EditorTheme.h"
@@ -33,6 +34,9 @@
 #include <glm/gtx/quaternion.hpp>
 #include <exception>
 #include <cstdlib>
+#include <optional>
+#include <string>
+#include <vector>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -232,6 +236,24 @@ int main() {
     fe::Window window;
     if (!window.init(fe::WindowSpec{})) return 1;
     fe::FileDrop::install(window.handle());
+
+    // Window icon (title bar, task bar, Alt+Tab). The PNGs are copied next to
+    // the executable by the build; if they are missing the default icon stays.
+    {
+        std::vector<fe::ImageData> images;
+        for (const int size : {16, 32, 48, 64, 128, 256}) {
+            const std::filesystem::path file =
+                exeDir / "branding" / ("fractalis-icon-" + std::to_string(size) + ".png");
+            if (std::optional<fe::ImageData> image = fe::loadImage(file))
+                images.push_back(std::move(*image));
+        }
+        std::vector<GLFWimage> icons;
+        for (fe::ImageData& image : images)
+            icons.push_back({static_cast<int>(image.width), static_cast<int>(image.height),
+                             image.pixels.data()});
+        if (!icons.empty())
+            glfwSetWindowIcon(window.handle(), static_cast<int>(icons.size()), icons.data());
+    }
 
     fe::VulkanContext vkCtx;
     if (!vkCtx.init(window)) return 1;

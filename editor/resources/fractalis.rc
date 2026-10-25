@@ -1,0 +1,6 @@
+// Icon of FEditor.exe.
+//
+// GLFW looks for an icon resource called "GLFW_ICON" when it registers its
+// window class, and uses it for the task bar and the title bar. The same
+// resource is the one Explorer shows for the file, so one line does both.
+GLFW_ICON ICON "../../branding/fractalis.ico"

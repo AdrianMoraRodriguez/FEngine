@@ -59,7 +59,10 @@ void ImageThumbnails::release(Entry& entry) {
 }
 
 void ImageThumbnails::shutdown() {
-    if (!m_ctx) return;
+    // Nothing to free: either it never held a picture, or shutdown() already ran.
+    // The destructor calls this again after the Vulkan device is gone, so it
+    // must not touch the device then.
+    if (!m_ctx || m_entries.empty()) return;
 
     // A decode in progress owns nothing the GPU uses; just let it finish.
     for (auto& [key, entry] : m_entries)
