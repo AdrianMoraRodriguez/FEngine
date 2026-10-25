@@ -11,6 +11,7 @@ void registerBuiltinComponents() {
 
     // Optional rendering components.
     r.add<MeshRenderer>    ("MeshRenderer");
+    r.add<MaterialComponent>("Material");
     r.add<CameraComponent> ("Camera");
     r.add<LightComponent>  ("Light");
 }

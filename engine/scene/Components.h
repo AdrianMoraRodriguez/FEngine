@@ -151,6 +151,25 @@ struct MeshRenderer {
 };
 
 /**
+ * @brief How the surface of an entity's mesh looks.
+ *
+ * Optional: a mesh without it is drawn with its own vertex colours only.
+ * The final colour of a pixel is
+ * `vertex colour * baseColor * texture colour`, so the defaults (white tint,
+ * no texture) change nothing.
+ */
+struct MaterialComponent {
+    /// Tint, as sRGB colour (what the colour picker shows). Multiplies the
+    /// vertex colour and the texture.
+    glm::vec3 baseColor{1.0f};
+
+    /// Albedo (colour) texture, as a path relative to the asset folder with
+    /// '/' as separator, or empty for none. Stored as text so a scene file
+    /// means the same on every machine.
+    std::string albedoTexture;
+};
+
+/**
  * @brief Marks an entity as the scene's primary camera.
  *
  * The renderer uses the first entity it finds with primary == true.
@@ -217,6 +236,7 @@ struct LightComponent {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NameComponent, name)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Transform, position, rotation, scale)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MeshRenderer, mesh, material, castShadows)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(MaterialComponent, baseColor, albedoTexture)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(CameraComponent, fovDegrees, nearPlane, farPlane, primary)
 
 // The WITH_DEFAULT variant fills in any key the file does not have. Scenes
@@ -237,6 +257,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(LightComponent, type, color, int
 bool inspect(NameComponent&);
 bool inspect(Transform&);
 bool inspect(MeshRenderer&);
+bool inspect(MaterialComponent&);
 bool inspect(CameraComponent&);
 bool inspect(LightComponent&);
 

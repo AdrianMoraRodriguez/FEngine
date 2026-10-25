@@ -171,6 +171,14 @@ std::optional<MeshData> importWithAssimp(const std::filesystem::path& file,
                 vertex.color *= glm::vec3(c.r, c.g, c.b);
             }
 
+            // Assimp follows the OpenGL convention (V up from the bottom of
+            // the image, for every format it reads); we use the image-file
+            // convention (V down from the top), hence the flip.
+            if (mesh->HasTextureCoords(0)) {
+                const aiVector3D& t = mesh->mTextureCoords[0][v];
+                vertex.uv = glm::vec2(t.x, 1.0f - t.y);
+            }
+
             result.vertices.push_back(vertex);
         }
         convertedVertices += mesh->mNumVertices;

@@ -115,6 +115,7 @@ glm::mat4 cascadeViewProjection(const glm::vec3& direction,
 
 bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
     if (!m_meshes.init(ctx)) return false;
+    if (!m_textures.init(ctx)) return false;   // before the pipeline: its layout is set 1
 
     // The shadow map comes before the uniforms (their descriptor sets point
     // at it), and the uniforms before the pipeline (its layout is built from
@@ -147,7 +148,8 @@ bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
                          OffscreenBuffer::format(),
                          OffscreenBuffer::depthFormat(),
                          shaderDir,
-                         m_uniforms.layout())) return false;
+                         m_uniforms.layout(),
+                         m_textures.layout())) return false;
 
     if (!m_outline.init(ctx, OffscreenBuffer::format(), OffscreenBuffer::depthFormat(), shaderDir))
         return false;
@@ -164,11 +166,13 @@ void SceneRenderer::shutdown() {
     for (ShadowMap& map : m_shadowMaps) map.shutdown();
     for (ShadowCube& cube : m_shadowCubes) cube.shutdown();
     m_shadowCascades.shutdown();
+    m_textures.shutdown();
     m_meshes.shutdown();
 }
 
 void SceneRenderer::prepare(const Scene& scene) {
     m_meshes.beginFrame();
+    m_textures.update();
 
     auto view = scene.registry().view<const MeshRenderer>();
     for (auto [entity, renderer] : view.each())
@@ -226,6 +230,7 @@ bool SceneRenderer::renderPreview(VkCommandBuffer cmd, AssetHandle handle,
 
     m_pipeline.bind(cmd, extent);
     m_pipeline.bindDescriptorSet(cmd, m_uniforms.set(SceneUniforms::kPreviewSlot));
+    m_pipeline.bindMaterial(cmd, m_textures.fallback());
     m_pipeline.push(cmd, MeshPushConstants{proj * view, glm::mat4(1.0f)});
     mesh->draw(cmd);
 
@@ -640,13 +645,31 @@ void SceneRenderer::render(VkCommandBuffer cmd,
     m_pipeline.bind(cmd, extent);
     m_pipeline.bindDescriptorSet(cmd, m_uniforms.set(frameIndex));
 
+    // Set 1 must be bound before the first draw; the loop rebinds it only
+    // when the texture changes.
+    VkDescriptorSet boundTexture = m_textures.fallback();
+    m_pipeline.bindMaterial(cmd, boundTexture);
+
     auto view = scene.registry().view<const MeshRenderer, const WorldTransform>();
     for (auto [entity, renderer, world] : view.each()) {
         const MeshBuffer* mesh = m_meshes.get(renderer.mesh);
         if (!mesh) continue;   // MeshNone, or a model that is unknown or failed to load
 
-        MeshPushConstants pc{viewProj * world.matrix, world.matrix};
-        m_pipeline.push(cmd, pc);
+        // The material is optional: without one, the mesh keeps its own colours.
+        glm::vec3       tint(1.0f);
+        VkDescriptorSet textureSet = m_textures.fallback();
+        if (const auto* material = scene.registry().try_get<MaterialComponent>(entity)) {
+            tint       = material->baseColor;
+            textureSet = m_textures.request(material->albedoTexture);
+        }
+
+        // Neighbouring objects often share a texture; skip the redundant bind.
+        if (textureSet != boundTexture) {
+            m_pipeline.bindMaterial(cmd, textureSet);
+            boundTexture = textureSet;
+        }
+
+        m_pipeline.push(cmd, MeshPushConstants{viewProj * world.matrix, world.matrix, tint});
         mesh->draw(cmd);
     }
 }

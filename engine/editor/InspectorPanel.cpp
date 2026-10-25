@@ -23,6 +23,7 @@ const char* iconForComponent(const std::string& name) {
 
     auto has = [&](const char* word) { return lower.find(word) != std::string::npos; };
     if (has("transform")) return FE_ICON_MOVE_3D;
+    if (has("material"))  return FE_ICON_PALETTE;
     if (has("mesh"))      return FE_ICON_CUBOID;
     if (has("camera"))    return FE_ICON_VIDEO;
     if (has("light"))     return FE_ICON_LIGHTBULB;

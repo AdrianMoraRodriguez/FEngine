@@ -13,6 +13,6 @@ namespace fe::fontdata {
 
 extern const unsigned char kInterRegular[42232];   ///< TrueType file, 42232 bytes.
 extern const unsigned char kInterSemiBold[42312];   ///< TrueType file, 42312 bytes.
-extern const unsigned char kLucide[18672];   ///< TrueType file, 18672 bytes.
+extern const unsigned char kLucide[20744];   ///< TrueType file, 20744 bytes.
 
 } // namespace fe::fontdata

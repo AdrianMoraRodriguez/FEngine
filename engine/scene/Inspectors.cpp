@@ -10,6 +10,11 @@
 
 #include "scene/Components.h"
 
+#include "core/AssetPaths.h"
+#include "core/Log.h"
+#include "core/PathUtil.h"
+#include "editor/Icons.h"
+
 #include <imgui.h>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/euler_angles.hpp>
@@ -78,6 +83,56 @@ bool inspect(MeshRenderer& m) {
 
     ImGui::Text("Material : %llu", m.material);
     changed |= ImGui::Checkbox("Cast Shadows", &m.castShadows);
+    return changed;
+}
+
+bool inspect(MaterialComponent& m) {
+    bool changed = false;
+
+    changed |= ImGui::ColorEdit3("Base Color", glm::value_ptr(m.baseColor));
+
+    // ---- Albedo texture slot ----
+    // A wide button that shows the file name. Images dragged from the Asset
+    // Browser can be dropped on it. The drop target belongs to the last item,
+    // so it comes right after the button.
+    ImGui::TextUnformatted("Albedo");
+    ImGui::SameLine();
+
+    const bool  hasTexture = !m.albedoTexture.empty();
+    const float clearWidth = ImGui::GetFrameHeight();
+    const float slotWidth  = ImGui::GetContentRegionAvail().x - (hasTexture ? clearWidth + ImGui::GetStyle().ItemSpacing.x : 0.0f);
+
+    std::string label = hasTexture ? m.albedoTexture : std::string("None (drop an image)");
+    label += "##albedo";
+    ImGui::Button(label.c_str(), ImVec2(slotWidth, 0.0f));
+
+    if (hasTexture && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", m.albedoTexture.c_str());
+
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FE_IMAGE")) {
+            // The Asset Browser sends the path as UTF-8 text.
+            const std::filesystem::path file(std::u8string(
+                reinterpret_cast<const char8_t*>(payload->Data)));
+            const std::string relative = assets::toRelative(file);
+            if (relative.empty()) {
+                FE_WARN("Material: '%s' is not inside the asset folder", toUtf8(file).c_str());
+            } else {
+                m.albedoTexture = relative;
+                changed = true;
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    if (hasTexture) {
+        ImGui::SameLine();
+        if (ImGui::Button(FE_ICON_X "##clearAlbedo", ImVec2(clearWidth, 0.0f))) {
+            m.albedoTexture.clear();
+            changed = true;
+        }
+    }
+
     return changed;
 }
 

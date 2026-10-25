@@ -64,7 +64,8 @@ bool MeshPipeline::init(const VulkanContext& ctx,
                         VkFormat colorFormat,
                         VkFormat depthFormat,
                         const char* shaderDir,
-                        VkDescriptorSetLayout sceneLayout) {
+                        VkDescriptorSetLayout sceneLayout,
+                        VkDescriptorSetLayout materialLayout) {
     m_ctx = &ctx;
 
     // ---- Shader modules ----
@@ -156,7 +157,7 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates    = dynamicStates;
 
-    // ---- Pipeline layout: set 0 (scene data) + push constants ----
+    // ---- Pipeline layout: set 0 (scene data), set 1 (material) + push constants ----
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushRange.offset     = 0;
@@ -164,8 +165,9 @@ bool MeshPipeline::init(const VulkanContext& ctx,
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount         = 1;
-    layoutInfo.pSetLayouts            = &sceneLayout;
+    const VkDescriptorSetLayout setLayouts[] = {sceneLayout, materialLayout};
+    layoutInfo.setLayoutCount         = 2;
+    layoutInfo.pSetLayouts            = setLayouts;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges    = &pushRange;
 
@@ -236,6 +238,13 @@ void MeshPipeline::bindDescriptorSet(VkCommandBuffer cmd, VkDescriptorSet sceneS
                             0,               // first set number: set 0
                             1, &sceneSet,
                             0, nullptr);     // no dynamic offsets
+}
+
+void MeshPipeline::bindMaterial(VkCommandBuffer cmd, VkDescriptorSet materialSet) const {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
+                            1,               // first set number: set 1
+                            1, &materialSet,
+                            0, nullptr);
 }
 
 void MeshPipeline::push(VkCommandBuffer cmd, const MeshPushConstants& pc) const {

@@ -3,6 +3,7 @@
  * @brief Entry point of the FEngine editor.
  */
 
+#include "core/AssetPaths.h"
 #include "core/Log.h"
 #include "core/Version.h"
 #include "platform/Window.h"
@@ -15,6 +16,9 @@
 #include "scene/ComponentRegistry.h"
 #include "scene/SceneSerializer.h"
 #include "editor/AssetBrowser.h"
+#include "editor/ImageThumbnails.h"
+#include "editor/ImageViewerPanel.h"
+#include "editor/FileDrop.h"
 #include "editor/EditorTheme.h"
 #include "editor/EditorCamera.h"
 #include "editor/SceneFileController.h"
@@ -227,6 +231,7 @@ int main() {
 
     fe::Window window;
     if (!window.init(fe::WindowSpec{})) return 1;
+    fe::FileDrop::install(window.handle());
 
     fe::VulkanContext vkCtx;
     if (!vkCtx.init(window)) return 1;
@@ -242,6 +247,7 @@ int main() {
     fe::SceneRenderer sceneRenderer;
     if (!sceneRenderer.init(vkCtx, shaderDir.string().c_str())) return 1;
     sceneRenderer.meshes().setAssetRoot(assetsDir);
+    fe::assets::setRoot(assetsDir);
     sceneRenderer.meshes().scanAssets();
 
     fe::registerBuiltinComponents();
@@ -313,11 +319,17 @@ int main() {
     fe::ViewportPanel   viewportPanel  {offscreen, editorCamera, scene, selectedEntity, sceneRenderer};
     fe::StatisticsPanel statisticsPanel{scene, renderer, deltaTime, frameCount};
     fe::AssetBrowser    assetBrowser   {assetsDir};
+    fe::ImageViewerPanel imageViewer   {vkCtx};
 
     // Small pictures of the models shown in the Asset Browser, drawn on demand.
     fe::ThumbnailRenderer thumbnails;
     thumbnails.init(vkCtx, sceneRenderer);
     assetBrowser.setThumbnails(&thumbnails);
+
+    // Pictures of the image files, for their tiles.
+    fe::ImageThumbnails imageThumbnails;
+    imageThumbnails.init(vkCtx);
+    assetBrowser.setImageThumbnails(&imageThumbnails);
 
     // New / Open / Save. The starting scene counts as saved, so replacing it
     // right away does not ask for confirmation.
@@ -330,6 +342,7 @@ int main() {
         &viewportPanel,
         &statisticsPanel,
         &assetBrowser,
+        &imageViewer,
     };
 
     // The editor closes once the scene files controller says nothing would be
@@ -341,6 +354,21 @@ int main() {
         ++frameCount;
 
         window.pollEvents();
+
+        // Files dropped from the OS file explorer go to the Asset Browser.
+        {
+            std::vector<std::filesystem::path> dropped = fe::FileDrop::take();
+            if (!dropped.empty()) {
+                // The window may not have the focus (the drag came from
+                // another application), in which case ImGui has not heard
+                // where the cursor is. Tell it, so the Asset Browser can
+                // tell which folder the files were dropped on.
+                double x = 0.0, y = 0.0;
+                glfwGetCursorPos(window.handle(), &x, &y);
+                ImGui::GetIO().AddMousePosEvent(static_cast<float>(x), static_cast<float>(y));
+                assetBrowser.onFilesDropped(std::move(dropped));
+            }
+        }
 
         // The window's close button, or Alt+F4: do not let the window close
         // by itself. Ask the controller, which may show the Unsaved Changes
@@ -366,6 +394,12 @@ int main() {
             if (!scenePath.empty()) sceneFiles.openScene(scenePath);
         }
 
+        // An image double-clicked in the Asset Browser opens in a viewer tab.
+        {
+            const std::filesystem::path imagePath = assetBrowser.takeImageToOpen();
+            if (!imagePath.empty()) imageViewer.open(imagePath);
+        }
+
         sceneFiles.onImGui();   // shortcuts and the Open / Save / Discard dialogs
 
         ImGui::Render();
@@ -380,6 +414,7 @@ int main() {
 
         // Same reason for the thumbnails: finished models are uploaded here.
         thumbnails.update();
+        imageThumbnails.update();
 
         // ----- GPU frame -----
         if (!renderer.beginFrame()) continue;
@@ -444,6 +479,8 @@ int main() {
     vkDeviceWaitIdle(vkCtx.device());
     lap("waiting for the GPU");
 
+    imageThumbnails.shutdown();
+    imageViewer.shutdown();  // same: its pictures are ImGui textures
     thumbnails.shutdown();   // its pictures are ImGui textures: before ImGui goes away
     lap("thumbnails");
     sceneRenderer.shutdown();

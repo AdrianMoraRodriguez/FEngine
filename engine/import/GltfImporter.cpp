@@ -44,6 +44,7 @@ bool appendPrimitive(const cgltf_primitive& primitive,
     const cgltf_accessor* positionAccessor = nullptr;
     const cgltf_accessor* normalAccessor   = nullptr;
     const cgltf_accessor* colorAccessor    = nullptr;
+    const cgltf_accessor* uvAccessor       = nullptr;
 
     for (cgltf_size i = 0; i < primitive.attributes_count; ++i) {
         const cgltf_attribute& attribute = primitive.attributes[i];
@@ -52,6 +53,7 @@ bool appendPrimitive(const cgltf_primitive& primitive,
         if (attribute.type == cgltf_attribute_type_position) positionAccessor = attribute.data;
         if (attribute.type == cgltf_attribute_type_normal)   normalAccessor   = attribute.data;
         if (attribute.type == cgltf_attribute_type_color)    colorAccessor    = attribute.data;
+        if (attribute.type == cgltf_attribute_type_texcoord) uvAccessor       = attribute.data;
     }
 
     if (!positionAccessor || positionAccessor->count == 0) return false;
@@ -84,6 +86,13 @@ bool appendPrimitive(const cgltf_primitive& primitive,
             return false;
         }
     }
+
+    // ---- Texture coordinates ----
+    // glTF already uses the image-file convention (V down from the top), and
+    // cgltf converts normalised integer storage to floats for us.
+    std::vector<float> uvData;
+    if (uvAccessor && uvAccessor->count == vertexCount)
+        uvData = readFloats(uvAccessor);
 
     // ---- Normals ----
     std::vector<glm::vec3> normals(vertexCount, glm::vec3(0.0f));
@@ -143,6 +152,9 @@ bool appendPrimitive(const cgltf_primitive& primitive,
             vertex.color *= glm::vec3(vertexColors[colorComponents * v],
                                       vertexColors[colorComponents * v + 1],
                                       vertexColors[colorComponents * v + 2]);
+
+        if (uvData.size() >= 2 * vertexCount)
+            vertex.uv = glm::vec2(uvData[2 * v], uvData[2 * v + 1]);
 
         out.vertices.push_back(vertex);
     }

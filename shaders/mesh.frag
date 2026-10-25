@@ -3,6 +3,12 @@
 layout(location = 0) in vec3 fragNormal;
 layout(location = 1) in vec3 fragColor;
 layout(location = 2) in vec3 fragWorldPos;
+layout(location = 3) in vec2 fragUv;
+
+/// Albedo (colour) texture of the material. Set 1 is bound for every draw; an
+/// object without a texture gets a 1x1 white one, so this multiplies by 1.
+/// The image is stored as sRGB, so the GPU hands back linear values.
+layout(set = 1, binding = 0) uniform sampler2D albedoMap;
 
 /// Final pixel colour written to the render target.
 layout(location = 0) out vec4 outColor;
@@ -481,7 +487,7 @@ void main() {
     // The whole calculation runs in linear light: the surface colour comes in
     // as sRGB and is converted first, and only the final, tone-mapped result
     // goes back to sRGB for the screen.
-    vec3 albedo = srgbToLinear(fragColor);
+    vec3 albedo = srgbToLinear(fragColor) * texture(albedoMap, fragUv).rgb;
     vec3 lit    = albedo * (scene.ambientColor.rgb + diffuseLight);
     outColor    = vec4(linearToSrgb(toneMapACES(lit)), 1.0);
 }

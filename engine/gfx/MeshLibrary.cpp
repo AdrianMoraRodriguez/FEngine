@@ -55,10 +55,12 @@ void addFace(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
              const glm::vec3& normal, const glm::vec3& color) {
     const uint32_t base = static_cast<uint32_t>(vertices.size());
 
-    vertices.push_back({a, normal, color});
-    vertices.push_back({b, normal, color});
-    vertices.push_back({c, normal, color});
-    vertices.push_back({d, normal, color});
+    // The image is mapped upright onto the face: a is the bottom-left corner
+    // as seen from outside, c the top-right one. V grows downwards.
+    vertices.push_back({a, normal, color, {0.0f, 1.0f}});
+    vertices.push_back({b, normal, color, {1.0f, 1.0f}});
+    vertices.push_back({c, normal, color, {1.0f, 0.0f}});
+    vertices.push_back({d, normal, color, {0.0f, 0.0f}});
 
     const uint32_t quad[6] = {0, 1, 2, 2, 3, 0};
     for (uint32_t i : quad)
@@ -105,10 +107,11 @@ bool MeshLibrary::init(const VulkanContext& ctx) {
         const glm::vec3 grey{0.35f};
 
         const std::vector<Vertex> vertices = {
-            {{-0.5f, 0.0f, -0.5f}, up, grey},
-            {{ 0.5f, 0.0f, -0.5f}, up, grey},
-            {{ 0.5f, 0.0f,  0.5f}, up, grey},
-            {{-0.5f, 0.0f,  0.5f}, up, grey},
+            // Seen from above with +X to the right, -Z is the top of the image.
+            {{-0.5f, 0.0f, -0.5f}, up, grey, {0.0f, 0.0f}},
+            {{ 0.5f, 0.0f, -0.5f}, up, grey, {1.0f, 0.0f}},
+            {{ 0.5f, 0.0f,  0.5f}, up, grey, {1.0f, 1.0f}},
+            {{-0.5f, 0.0f,  0.5f}, up, grey, {0.0f, 1.0f}},
         };
         const std::vector<uint32_t> indices = {0, 3, 2, 0, 2, 1};
 

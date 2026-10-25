@@ -10,6 +10,7 @@
 #include "gfx/MeshPipeline.h"
 #include "gfx/OutlinePass.h"
 #include "gfx/SceneUniforms.h"
+#include "gfx/TextureLibrary.h"
 #include "gfx/ShadowCascades.h"
 #include "gfx/ShadowCube.h"
 #include "gfx/ShadowMap.h"
@@ -208,6 +209,9 @@ public:
     /// @return The mesh library, used to register models.
     MeshLibrary& meshes() { return m_meshes; }
 
+    /// The textures that materials use.
+    TextureLibrary& textures() { return m_textures; }
+
 private:
     /// Fills the preview slot of the uniforms with the light renderPreview() uses.
     void setupPreviewLighting();
@@ -238,6 +242,7 @@ private:
     OutlinePass    m_outline;
     bool           m_outlineActive = false;   ///< A mask was drawn this frame.
     MeshLibrary    m_meshes;
+    TextureLibrary m_textures;
 };
 
 } // namespace fe
