@@ -66,6 +66,30 @@ void SceneFileController::requestOpen(const std::filesystem::path& path) {
     }
 }
 
+void SceneFileController::requestQuit() {
+    // A dialog is already waiting for an answer: do not stack another one.
+    if (m_pendingAction != Action::None) return;
+
+    if (isDirty()) {
+        m_pendingAction        = Action::Quit;
+        m_requestUnsavedDialog = true;
+    } else {
+        m_quitConfirmed = true;
+    }
+}
+
+void SceneFileController::runPendingAction() {
+    const Action action = m_pendingAction;
+    m_pendingAction = Action::None;
+
+    switch (action) {
+        case Action::New:  doNew();                 break;
+        case Action::Open: doOpen(m_pendingPath);   break;
+        case Action::Quit: m_quitConfirmed = true;  break;
+        case Action::None:                          break;
+    }
+}
+
 void SceneFileController::requestSave() {
     if (m_currentPath.empty())
         m_requestSaveAsDialog = true;   // never saved: ask for a name first
@@ -251,35 +275,51 @@ void SceneFileController::drawSaveAsModal() {
     ImGui::BeginDisabled(!valid);
     if (ImGui::Button("Save") || (enterPressed && valid)) {
         m_scene.setName(target.stem().string());
-        doSave(target);
+        // If this dialog was opened by the Unsaved Changes one, carry on with
+        // what the user was doing once the scene is safely on disk.
+        if (doSave(target)) runPendingAction();
+        else                m_pendingAction = Action::None;
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndDisabled();
 
     ImGui::SameLine();
-    if (ImGui::Button("Cancel"))
+    if (ImGui::Button("Cancel")) {
+        m_pendingAction = Action::None;   // the user backed out of the whole thing
         ImGui::CloseCurrentPopup();
+    }
 
     ImGui::EndPopup();
 }
 
 void SceneFileController::drawUnsavedModal() {
-    prepareModal(320.0f);
+    prepareModal(340.0f);
     if (!ImGui::BeginPopupModal("Unsaved Changes", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
         return;
 
-    ImGui::TextUnformatted("The current scene has unsaved changes.");
-    ImGui::TextUnformatted("Continue and discard them?");
+    const std::string name = m_currentPath.empty() ? m_scene.name()
+                                                   : m_currentPath.stem().string();
+    ImGui::Text("Save the changes made to \"%s\"?", name.c_str());
+    ImGui::TextDisabled("They will be lost if you do not save them.");
     ImGui::Spacing();
 
-    if (ImGui::Button("Discard changes")) {
-        const Action action = m_pendingAction;
-        m_pendingAction = Action::None;
+    if (ImGui::Button("Save")) {
+        if (m_currentPath.empty()) {
+            // Never saved: it needs a name first. The pending action stays
+            // queued and runs when the Save As dialog saves the scene.
+            m_requestSaveAsDialog = true;
+        } else if (doSave(m_currentPath)) {
+            runPendingAction();
+        } else {
+            m_pendingAction = Action::None;   // saving failed: stay where we are
+        }
+        ImGui::CloseCurrentPopup();
+    }
 
-        if (action == Action::New)       doNew();
-        else if (action == Action::Open) doOpen(m_pendingPath);
-
+    ImGui::SameLine();
+    if (ImGui::Button("Don't Save")) {
+        runPendingAction();
         ImGui::CloseCurrentPopup();
     }
 

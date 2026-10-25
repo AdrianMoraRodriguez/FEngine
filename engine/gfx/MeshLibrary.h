@@ -66,8 +66,16 @@ public:
     bool init(const VulkanContext& ctx);
 
     /// Destroys all GPU buffers. Safe to call more than once.
-    /// Asks imports still running in the background to stop, and waits for them.
+    /// Asks imports still running in the background to stop, and waits for
+    /// them for up to one second. An import that has not stopped by then is
+    /// left running (see importsStillRunning()) so that closing the editor is
+    /// never held up by a big file.
     void shutdown();
+
+    /// @return `true` if shutdown() gave up waiting for an import. Its thread
+    ///         is still running, so the program should end with
+    ///         std::quick_exit() instead of returning from main().
+    bool importsStillRunning() const { return m_importsStillRunning; }
 
     /// Sets the directory that model paths are relative to (normally `assets/`).
     void setAssetRoot(std::filesystem::path root);
@@ -119,9 +127,22 @@ public:
      * prepare() does), and not while recording a frame: the upload submits
      * its own work to the GPU.
      *
+     * @param track `false` for a caller that is not the scene (the thumbnails):
+     *              the model is then left out of importStatuses(), so that
+     *              loading a model only to draw its preview does not show a
+     *              progress bar over the viewport.
+     *
      * @return `true` if the mesh can be drawn right now.
      */
-    bool ensureLoaded(AssetHandle handle);
+    bool ensureLoaded(AssetHandle handle, bool track = true);
+
+    /**
+     * @return `true` if @p handle will not load by itself: the import failed,
+     *         was cancelled by the user, or the model is unknown.
+     */
+    bool isUnavailable(AssetHandle handle) const {
+        return m_failed.count(handle) != 0 || m_declined.count(handle) != 0;
+    }
 
     /**
      * @brief Lists the models used last frame that are not ready.
@@ -217,6 +238,9 @@ private:
 
     /// Imported models that ensureLoaded() was asked about since beginFrame().
     std::unordered_set<AssetHandle> m_used;
+
+    /// Set by shutdown() when it left an import running.
+    bool m_importsStillRunning = false;
 };
 
 } // namespace fe

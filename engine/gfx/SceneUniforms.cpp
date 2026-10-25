@@ -11,7 +11,7 @@ SceneUniforms::~SceneUniforms() { shutdown(); }
 
 bool SceneUniforms::init(const VulkanContext& ctx, const ShadowBindings& shadows) {
     m_ctx = &ctx;
-    constexpr uint32_t kFrames = Renderer::MAX_FRAMES_IN_FLIGHT;
+    constexpr uint32_t kFrames = Renderer::MAX_FRAMES_IN_FLIGHT + 1;   // + the preview slot
 
     // ------------------------------------------------------------------
     // 1. Layout: the contract.
@@ -216,7 +216,7 @@ void SceneUniforms::shutdown() {
 }
 
 void SceneUniforms::update(uint32_t frameIndex, const SceneUniformData& data) {
-    Slot& slot = m_slots[frameIndex % Renderer::MAX_FRAMES_IN_FLIGHT];
+    Slot& slot = m_slots[slotFor(frameIndex)];
     if (!slot.mapped) return;
 
     std::memcpy(slot.mapped, &data, sizeof(data));
@@ -226,7 +226,7 @@ void SceneUniforms::update(uint32_t frameIndex, const SceneUniformData& data) {
 }
 
 VkDescriptorSet SceneUniforms::set(uint32_t frameIndex) const {
-    return m_slots[frameIndex % Renderer::MAX_FRAMES_IN_FLIGHT].set;
+    return m_slots[slotFor(frameIndex)].set;
 }
 
 } // namespace fe

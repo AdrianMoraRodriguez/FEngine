@@ -10,10 +10,12 @@
 #include "gfx/Renderer.h"
 #include "gfx/OffscreenBuffer.h"
 #include "gfx/SceneRenderer.h"
+#include "gfx/ThumbnailRenderer.h"
 #include "scene/Scene.h"
 #include "scene/ComponentRegistry.h"
 #include "scene/SceneSerializer.h"
 #include "editor/AssetBrowser.h"
+#include "editor/EditorTheme.h"
 #include "editor/EditorCamera.h"
 #include "editor/SceneFileController.h"
 #include "editor/HierarchyPanel.h"
@@ -50,15 +52,17 @@ bool initImGui(const fe::VulkanContext& ctx,
                const fe::Renderer& renderer) {
 
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_SAMPLER,                1  },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          1  },
+        { VK_DESCRIPTOR_TYPE_SAMPLER,                1   },
+        // One per texture ImGui shows: its fonts, the viewport and the asset
+        // thumbnails (see ThumbnailRenderer::kMaxThumbnails).
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          1   },
     };
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    poolInfo.maxSets       = 16;
+    poolInfo.maxSets       = 512;
     poolInfo.poolSizeCount = 3;
     poolInfo.pPoolSizes    = poolSizes;
 
@@ -76,13 +80,11 @@ bool initImGui(const fe::VulkanContext& ctx,
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = "feditor_layout.ini";
 
-    ImGui::StyleColorsDark();
-
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding    = 4.0f;
-    style.FrameRounding     = 3.0f;
-    style.ScrollbarRounding = 3.0f;
-    style.GrabRounding      = 3.0f;
+    // Look of the editor: Inter + Lucide icons, FEngine colours and metrics.
+    // Both live in EditorTheme; apply() replaces every colour of the style,
+    // so there is no need for ImGui::StyleColorsDark() first.
+    fe::theme::loadFonts();
+    fe::theme::apply();
 
     ImGui_ImplGlfw_InitForVulkan(window.handle(), true);
 
@@ -134,7 +136,7 @@ void shutdownImGui(VkDevice device) {
 // Dockspace
 // ---------------------------------------------------------------------------
 
-void beginDockspace(bool& running, fe::SceneFileController& sceneFiles) {
+void beginDockspace(fe::SceneFileController& sceneFiles) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -163,7 +165,7 @@ void beginDockspace(bool& running, fe::SceneFileController& sceneFiles) {
         if (ImGui::BeginMenu("File")) {
             sceneFiles.drawMenuItems();
             ImGui::Separator();
-            if (ImGui::MenuItem("Exit", "Alt+F4")) running = false;
+            if (ImGui::MenuItem("Exit", "Alt+F4")) sceneFiles.requestQuit();
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
@@ -312,6 +314,11 @@ int main() {
     fe::StatisticsPanel statisticsPanel{scene, renderer, deltaTime, frameCount};
     fe::AssetBrowser    assetBrowser   {assetsDir};
 
+    // Small pictures of the models shown in the Asset Browser, drawn on demand.
+    fe::ThumbnailRenderer thumbnails;
+    thumbnails.init(vkCtx, sceneRenderer);
+    assetBrowser.setThumbnails(&thumbnails);
+
     // New / Open / Save. The starting scene counts as saved, so replacing it
     // right away does not ask for confirmation.
     fe::SceneFileController sceneFiles{scene, selectedEntity, assetsDir / "scenes"};
@@ -325,9 +332,9 @@ int main() {
         &assetBrowser,
     };
 
-    bool running = true;
-
-    while (running && !window.shouldClose()) {
+    // The editor closes once the scene files controller says nothing would be
+    // lost (see requestQuit()).
+    while (!sceneFiles.quitConfirmed()) {
         const double now = glfwGetTime();
         deltaTime = now - lastTime;
         lastTime  = now;
@@ -335,15 +342,29 @@ int main() {
 
         window.pollEvents();
 
+        // The window's close button, or Alt+F4: do not let the window close
+        // by itself. Ask the controller, which may show the Unsaved Changes
+        // dialog first, and keep running until it confirms.
+        if (window.shouldClose()) {
+            glfwSetWindowShouldClose(window.handle(), GLFW_FALSE);
+            sceneFiles.requestQuit();
+        }
+
         // ----- ImGui frame -----
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        beginDockspace(running, sceneFiles);
+        beginDockspace(sceneFiles);
 
         for (auto* panel : panels)
             panel->onImGui();
+
+        // A scene double-clicked in the Asset Browser opens like File > Open.
+        {
+            const std::filesystem::path scenePath = assetBrowser.takeSceneToOpen();
+            if (!scenePath.empty()) sceneFiles.openScene(scenePath);
+        }
 
         sceneFiles.onImGui();   // shortcuts and the Open / Save / Discard dialogs
 
@@ -356,6 +377,9 @@ int main() {
         // Upload any model the scene uses for the first time. It has to happen
         // here, before recording the frame, because loading submits its own GPU work.
         sceneRenderer.prepare(scene);
+
+        // Same reason for the thumbnails: finished models are uploaded here.
+        thumbnails.update();
 
         // ----- GPU frame -----
         if (!renderer.beginFrame()) continue;
@@ -374,19 +398,29 @@ int main() {
         sceneRenderer.renderShadows(cmd, scene, renderer.currentFrameIndex(),
                                     cameraView, cameraProjection);
 
-        // 2. Scene pass: draw the scene into the offscreen buffer.
+        const glm::mat4 viewProj = cameraProjection * cameraView;
+        const VkExtent2D extent{offscreen.width(), offscreen.height()};
+
+        // 2. The shape of the selected entity, for its outline. Like the
+        //    shadow pass, it opens passes of its own, so it comes first.
+        sceneRenderer.renderSelectionMask(cmd, scene, selectedEntity, viewProj, extent);
+
+        // 3. Scene pass: draw the scene into the offscreen buffer.
         fe::Renderer::beginOffscreenPass(cmd, offscreen);
 
-        const glm::mat4 viewProj = cameraProjection * cameraView;
-
         // The frame index picks this frame slot's copy of the scene's lights.
-        sceneRenderer.render(cmd, scene, viewProj,
-                             {offscreen.width(), offscreen.height()},
-                             renderer.currentFrameIndex());
+        sceneRenderer.render(cmd, scene, viewProj, extent, renderer.currentFrameIndex());
+
+        // The outline of the selected entity goes over everything else.
+        sceneRenderer.drawSelectionOutline(cmd, extent);
 
         fe::Renderer::endOffscreenPass(cmd, offscreen);
 
-        // 3. Swapchain pass: ImGui on top (the Viewport panel samples the
+        // 3b. Thumbnails of the models the Asset Browser asked for. Each one
+        //     is its own small pass; the pictures appear from the next frame.
+        thumbnails.render(cmd);
+
+        // 4. Swapchain pass: ImGui on top (the Viewport panel samples the
         //    offscreen colour image).
         renderer.beginSwapchainPass();
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
@@ -396,14 +430,39 @@ int main() {
     }
 
     FE_INFO("Shutting down");
-    vkDeviceWaitIdle(vkCtx.device());
 
+    // Say which step is slow, if one is: a shutdown that seems to hang is
+    // otherwise impossible to tell apart from one that is just waiting.
+    double lapStart = glfwGetTime();
+    auto lap = [&lapStart](const char* what) {
+        const double now = glfwGetTime();
+        if (now - lapStart > 0.25)
+            FE_WARN("Shutdown: %s took %.2f s", what, now - lapStart);
+        lapStart = now;
+    };
+
+    vkDeviceWaitIdle(vkCtx.device());
+    lap("waiting for the GPU");
+
+    thumbnails.shutdown();   // its pictures are ImGui textures: before ImGui goes away
+    lap("thumbnails");
     sceneRenderer.shutdown();
+    lap("scene renderer (models and imports)");
     offscreen.shutdown();
     shutdownImGui(vkCtx.device());
+    lap("ImGui");
     renderer.shutdown();
     vkCtx.shutdown();
+    lap("Vulkan");
     window.shutdown();
+
+    // An import that would not stop is still running on its own thread.
+    // Returning from main would run the static destructors underneath it, so
+    // leave right away: everything that needed an orderly shutdown has had it.
+    if (sceneRenderer.meshes().importsStillRunning()) {
+        std::fflush(nullptr);
+        std::quick_exit(0);
+    }
 
     return 0;
 }

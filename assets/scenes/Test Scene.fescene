@@ -30,7 +30,7 @@
         }
       },
       "parent": 0,
-      "uuid": 17248782915011111144
+      "uuid": 15913772284439327246
     },
     {
       "components": {
@@ -62,7 +62,7 @@
         }
       },
       "parent": 0,
-      "uuid": 8183304771483784691
+      "uuid": 6390161868525114358
     },
     {
       "components": {
@@ -94,7 +94,7 @@
         }
       },
       "parent": 0,
-      "uuid": 9284095276212053141
+      "uuid": 9563554959454884545
     },
     {
       "components": {
@@ -127,20 +127,22 @@
         }
       },
       "parent": 0,
-      "uuid": 16191521418959585876
+      "uuid": 3509095473599451175
     },
     {
       "components": {
         "Light": {
+          "castShadows": true,
           "color": [
-            0.970588207244873,
-            0.9134947657585144,
-            0.0
+            1.0,
+            1.0,
+            1.0
           ],
           "innerConeDegrees": 25.0,
           "intensity": 0.75,
           "outerConeDegrees": 30.0,
           "range": 10.0,
+          "shadowSoftness": 1.5,
           "type": 0
         },
         "Name": {
@@ -166,20 +168,22 @@
         }
       },
       "parent": 0,
-      "uuid": 9411372820260282091
+      "uuid": 13690908926442128803
     },
     {
       "components": {
         "Light": {
+          "castShadows": true,
           "color": [
             1.0,
-            0.0,
-            0.0
+            1.0,
+            1.0
           ],
           "innerConeDegrees": 25.0,
           "intensity": 8.0,
           "outerConeDegrees": 30.0,
           "range": 8.0,
+          "shadowSoftness": 0.15000000596046448,
           "type": 1
         },
         "Name": {
@@ -205,20 +209,22 @@
         }
       },
       "parent": 0,
-      "uuid": 18244406384513114609
+      "uuid": 3369135219793659858
     },
     {
       "components": {
         "Light": {
+          "castShadows": true,
           "color": [
-            0.0,
             1.0,
-            0.6470587253570557
+            1.0,
+            1.0
           ],
           "innerConeDegrees": 25.0,
           "intensity": 15.0,
           "outerConeDegrees": 30.0,
           "range": 8.0,
+          "shadowSoftness": 0.15000000596046448,
           "type": 2
         },
         "Name": {
@@ -244,9 +250,49 @@
         }
       },
       "parent": 0,
-      "uuid": 8570207641757985618
+      "uuid": 9845340132522339939
+    },
+    {
+      "components": {
+        "MeshRenderer": {
+          "castShadows": true,
+          "material": 0,
+          "mesh": 10628146637226648293
+        },
+        "Name": {
+          "name": "Pocketwatch"
+        },
+        "Transform": {
+          "position": [
+            0.7208831310272217,
+            0.0,
+            1.79405677318573
+          ],
+          "rotation": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "parent": 0,
+      "uuid": 832283930917973683
     }
   ],
   "name": "Test Scene",
+  "settings": {
+    "ambientColor": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "ambientIntensity": 0.25
+  },
   "version": 1
 }

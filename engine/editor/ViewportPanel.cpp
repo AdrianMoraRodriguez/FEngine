@@ -2,6 +2,8 @@
 
 #include "core/Log.h"
 #include "core/PathUtil.h"
+#include "editor/EditorTheme.h"
+#include "editor/Icons.h"
 
 #include <imgui.h>
 #include <ImGuizmo.h>
@@ -193,7 +195,7 @@ void ViewportPanel::onImGui() {
     const bool gizmoActive =
         drawGizmo(imageMin.x, imageMin.y, imageSize.x, imageSize.y);
     drawToolbar(imageMin.x + 8.0f, imageMin.y + 8.0f);
-    drawImportOverlay(imageMin.x + 8.0f, imageMin.y + 44.0f);
+    drawImportOverlay(imageMin.x + 8.0f, imageMin.y + 60.0f);
 
     // While a gizmo is being dragged the camera must stay still.
     m_camera.handleInput(imageHovered && !(gizmoActive && ImGuizmo::IsUsing()));
@@ -234,46 +236,143 @@ void ViewportPanel::focusSelected() {
 }
 
 void ViewportPanel::drawToolbar(float x, float y) {
-    ImGui::SetCursorScreenPos(ImVec2(x, y));
+    constexpr float kButton = 30.0f;   // side of each square button
+    constexpr float kGap    = 2.0f;    // between buttons
+    constexpr float kPad    = 5.0f;    // inside the bar
+    constexpr float kGroup  = 12.0f;   // space (with a divider) between groups
+    constexpr float kIcon   = 17.0f;   // icon size in pixels
 
-    auto toolButton = [this](const char* label, Tool tool) {
-        const bool active = (m_tool == tool);
-        if (active)
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        if (ImGui::Button(label))
-            m_tool = tool;
-        if (active)
-            ImGui::PopStyleColor();
-        ImGui::SameLine();
+    // Two groups: the four tools, then "space" and "focus".
+    constexpr float kWidth  = kPad * 2.0f + 6.0f * kButton + 4.0f * kGap + kGroup;
+    constexpr float kHeight = kPad * 2.0f + kButton;
+
+    // The bar is a rounded translucent panel, so the buttons stay readable
+    // over any scene. It is drawn first; the buttons are then drawn on top.
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 barMin(x, y);
+    const ImVec2 barMax(x + kWidth, y + kHeight);
+    draw->AddRectFilled(barMin, barMax, IM_COL32(18, 19, 23, 220), 9.0f);
+    draw->AddRect(barMin, barMax, IM_COL32(255, 255, 255, 22), 9.0f);
+
+    ImGui::SetCursorScreenPos(ImVec2(x + kPad, y + kPad));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kGap, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    ImGui::PushFont(nullptr, kIcon);   // keep the font, enlarge the icons
+
+    // One square icon button. An active button is filled with the accent;
+    // the others only light up when hovered.
+    auto iconButton = [](const char* id, const char* icon,
+                         const char* tooltip, bool active) {
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            active ? theme::accent() : ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            active ? theme::accent() : ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            active ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+                   : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+
+        ImGui::PushID(id);
+        const bool pressed = ImGui::Button(icon, ImVec2(kButton, kButton));
+        ImGui::PopID();
+        ImGui::PopStyleColor(3);
+
+        // Tooltips are normal-sized text, not icon-sized.
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase);
+        ImGui::SetItemTooltip("%s", tooltip);
+        ImGui::PopFont();
+        return pressed;
     };
 
-    toolButton("Q Select", Tool::Select);
-    toolButton("W Move",   Tool::Translate);
-    toolButton("E Rotate", Tool::Rotate);
-    toolButton("R Scale",  Tool::Scale);
+    if (iconButton("select", FE_ICON_MOUSE_POINTER_2, "Select (Q)", m_tool == Tool::Select))
+        m_tool = Tool::Select;
+    ImGui::SameLine();
+    if (iconButton("move", FE_ICON_MOVE, "Move (W)", m_tool == Tool::Translate))
+        m_tool = Tool::Translate;
+    ImGui::SameLine();
+    if (iconButton("rotate", FE_ICON_ROTATE_3D, "Rotate (E)", m_tool == Tool::Rotate))
+        m_tool = Tool::Rotate;
+    ImGui::SameLine();
+    if (iconButton("scale", FE_ICON_SCALING, "Scale (R)", m_tool == Tool::Scale))
+        m_tool = Tool::Scale;
 
-    if (ImGui::Button(m_localSpace ? "Local" : "World"))
+    // Thin divider between the groups.
+    const float dividerX = ImGui::GetItemRectMax().x + kGroup * 0.5f;
+    draw->AddLine(ImVec2(dividerX, y + kPad + 5.0f),
+                  ImVec2(dividerX, y + kHeight - kPad - 5.0f),
+                  IM_COL32(255, 255, 255, 30));
+    ImGui::SameLine(0.0f, kGroup);   // the divider sits in the middle of this gap
+
+    // The icon shows the current space; clicking switches to the other one.
+    const char* spaceTip = m_localSpace
+        ? "Gizmo space: Local (click for World)"
+        : "Gizmo space: World (click for Local)";
+    if (iconButton("space", m_localSpace ? FE_ICON_BOX : FE_ICON_GLOBE, spaceTip, false))
         m_localSpace = !m_localSpace;
+    ImGui::SameLine();
+
+    const bool hasSelection =
+        m_selected != entt::null && m_scene.registry().valid(m_selected);
+    ImGui::BeginDisabled(!hasSelection);
+    if (iconButton("focus", FE_ICON_FOCUS, "Focus selection (F)", false))
+        focusSelected();
+    ImGui::EndDisabled();
+
+    ImGui::PopFont();
+    ImGui::PopStyleVar(2);
 }
 
 void ViewportPanel::drawImportOverlay(float x, float y) {
-    m_overlayHovered = false;
-
     MeshLibrary& meshes = m_sceneRenderer.meshes();
     const std::vector<ImportStatus> statuses = meshes.importStatuses();
-    if (statuses.empty()) return;
+
+    // A cancelled import's message stays fully visible for kHoldSeconds, then
+    // fades out over kFadeSeconds and is gone (the model simply stays out of
+    // the scene). While the pointer is over the overlay the fade is paused, so
+    // there is always time to press Import. Progress bars and failures do not fade.
+    constexpr float kHoldSeconds = 2.5f;
+    constexpr float kFadeSeconds = 2.0f;
+
+    const float dt = ImGui::GetIO().DeltaTime;
+
+    // One entry per message that is still visible, with its opacity.
+    struct Shown { const ImportStatus* status; float alpha; };
+    std::vector<Shown> shown;
+    float panelAlpha = 0.0f;
+
+    for (auto it = m_declinedAge.begin(); it != m_declinedAge.end();) {
+        const bool stillDeclined = std::any_of(statuses.begin(), statuses.end(),
+            [&](const ImportStatus& s) { return s.handle == it->first &&
+                                                s.state == ImportState::Declined; });
+        it = stillDeclined ? std::next(it) : m_declinedAge.erase(it);   // retried, or no longer used
+    }
+
+    for (const ImportStatus& s : statuses) {
+        float alpha = 1.0f;
+        if (s.state == ImportState::Declined) {
+            float& age = m_declinedAge.try_emplace(s.handle, 0.0f).first->second;
+            if (!m_overlayHovered) age += dt;   // m_overlayHovered still holds last frame's value
+            alpha = 1.0f - std::clamp((age - kHoldSeconds) / kFadeSeconds, 0.0f, 1.0f);
+            if (alpha <= 0.0f) continue;
+        }
+        shown.push_back({&s, alpha});
+        panelAlpha = std::max(panelAlpha, alpha);
+    }
+
+    m_overlayHovered = false;
+    if (shown.empty()) return;
 
     // Buttons pressed below change the library, so they are only recorded
     // here and applied after the list has been drawn.
     AssetHandle toConfirm = 0;
     AssetHandle toCancel  = 0;
+    AssetHandle toDismiss = 0;
 
     ImGui::SetCursorScreenPos(ImVec2(x, y));
 
     // The viewport window has no padding (the image fills it), so the
     // overlay brings its own.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, panelAlpha);   // the panel fades with its last message
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.09f, 0.85f));
 
     if (ImGui::BeginChild("##imports", ImVec2(340.0f, 0.0f),
@@ -281,7 +380,9 @@ void ViewportPanel::drawImportOverlay(float x, float y) {
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
         m_overlayHovered = ImGui::IsWindowHovered();
 
-        for (const ImportStatus& s : statuses) {
+        for (const Shown& item : shown) {
+            const ImportStatus& s = *item.status;
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, item.alpha);
             ImGui::PushID(static_cast<int>(s.handle ^ (s.handle >> 32)));
 
             switch (s.state) {
@@ -295,6 +396,14 @@ void ViewportPanel::drawImportOverlay(float x, float y) {
                 case ImportState::Declined:
                     ImGui::TextWrapped("%s: import cancelled.", s.name.c_str());
                     if (ImGui::Button("Import")) toConfirm = s.handle;
+
+                    // The X, at the right end of the row, closes the message
+                    // without waiting for it to fade.
+                    ImGui::SameLine(ImGui::GetContentRegionMax().x
+                                    - ImGui::CalcTextSize(FE_ICON_X).x
+                                    - ImGui::GetStyle().FramePadding.x * 2.0f);
+                    if (ImGui::Button(FE_ICON_X)) toDismiss = s.handle;
+                    ImGui::SetItemTooltip("Dismiss");
                     break;
 
                 case ImportState::Failed:
@@ -305,13 +414,17 @@ void ViewportPanel::drawImportOverlay(float x, float y) {
             }
 
             ImGui::PopID();
+            ImGui::PopStyleVar();   // the entry's own opacity
             ImGui::Spacing();
         }
     }
     ImGui::EndChild();
 
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);          // the panel's opacity and padding
+
+    // A dismissed message is simply one that has finished fading.
+    if (toDismiss != 0) m_declinedAge[toDismiss] = kHoldSeconds + kFadeSeconds;
 
     if (toConfirm != 0) meshes.confirmImport(toConfirm);
     if (toCancel  != 0) meshes.cancelImport(toCancel);
@@ -609,6 +722,11 @@ void ViewportPanel::instantiateModel(const std::filesystem::path& file,
                                      float x, float y, float width, float height) {
     const AssetHandle handle = m_sceneRenderer.meshes().registerModel(file);
     if (handle == builtin::MeshNone) return;   // registerModel already said why
+
+    // Dropping a model again is a fresh request for it: if its import was
+    // cancelled earlier (and the message has faded away, so there is no
+    // Import button any more), start it now. Does nothing for other models.
+    m_sceneRenderer.meshes().confirmImport(handle);
 
     // Place the model where the cursor ray meets the ground plane (y = 0).
     // If the ray never reaches the ground, or it is absurdly far, put the

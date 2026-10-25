@@ -10,6 +10,7 @@
 #include <entt/entt.hpp>
 
 #include <filesystem>
+#include <unordered_map>
 
 namespace fe {
 
@@ -58,7 +59,8 @@ private:
     /// Switches tool on Q / W / E / R and focuses the selection on F.
     void handleShortcuts();
 
-    /// Draws the tool buttons with their top-left corner at the given screen position.
+    /// Draws the toolbar (tools, gizmo space, focus) as a rounded bar of icon
+    /// buttons with its top-left corner at the given screen position.
     void drawToolbar(float x, float y);
 
     /**
@@ -123,6 +125,12 @@ private:
     /// The pointer is over the import overlay this frame, so a click there
     /// must not select whatever is behind it.
     bool m_overlayHovered = false;
+
+    /// Seconds each "import cancelled" message has been on screen, by model.
+    /// The message stays fully visible for a moment, then fades away; see
+    /// drawImportOverlay(). Entries leave the map once the model is no longer
+    /// in the cancelled state.
+    std::unordered_map<AssetHandle, float> m_declinedAge;
 };
 
 } // namespace fe

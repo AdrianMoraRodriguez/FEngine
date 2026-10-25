@@ -25,7 +25,8 @@ namespace fe {
  *
  * Unsaved changes are detected by comparing the serialised scene with the
  * text of the last save, so no hook is needed on every edit. The comparison
- * only runs when the user asks for New or Open.
+ * only runs when the user asks for New, Open or to quit. In those cases the
+ * Unsaved Changes dialog offers Save, Don't Save and Cancel.
  *
  * Usage, once per frame:
  * @code
@@ -59,6 +60,29 @@ public:
      */
     void onImGui();
 
+    /**
+     * @brief Opens the scene stored in @p path, like File > Open Scene.
+     *
+     * If the current scene has unsaved changes, the Unsaved Changes dialog
+     * is shown first and the scene is only opened once the user has saved or
+     * discarded them. Used by the Asset Browser (double click on a scene).
+     */
+    void openScene(const std::filesystem::path& path) { requestOpen(path); }
+
+    /**
+     * @brief Asks to close the editor.
+     *
+     * With nothing unsaved, quitConfirmed() becomes `true` right away.
+     * Otherwise the Unsaved Changes dialog opens, and it becomes `true` only
+     * once the user has saved or chosen to discard the changes. Cancelling
+     * leaves the editor open. Call it from the Exit menu and when the window
+     * is asked to close.
+     */
+    void requestQuit();
+
+    /// @return `true` once the editor may close without losing work.
+    bool quitConfirmed() const { return m_quitConfirmed; }
+
     /// Records the current scene as saved. Call after building a startup scene.
     void markClean();
 
@@ -67,11 +91,14 @@ public:
 
 private:
     /// Action waiting for the user to confirm discarding unsaved changes.
-    enum class Action { None, New, Open };
+    enum class Action { None, New, Open, Quit };
 
     void requestNew();
     void requestOpen(const std::filesystem::path& path);
     void requestSave();
+
+    /// Carries out the action the Unsaved Changes dialog was holding back.
+    void runPendingAction();
 
     void doNew();
     void doOpen(const std::filesystem::path& path);
@@ -102,6 +129,8 @@ private:
     bool m_requestOpenDialog   = false;
     bool m_requestSaveAsDialog = false;
     bool m_requestUnsavedDialog = false;
+
+    bool m_quitConfirmed = false;   ///< Set once the editor is allowed to close.
 
     Action                m_pendingAction = Action::None;
     std::filesystem::path m_pendingPath;

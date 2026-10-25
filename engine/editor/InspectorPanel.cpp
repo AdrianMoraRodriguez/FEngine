@@ -1,13 +1,35 @@
 #include "editor/InspectorPanel.h"
 
+#include "editor/EditorTheme.h"
+#include "editor/Icons.h"
 #include "scene/ComponentRegistry.h"
 
 #include <imgui.h>
 #include <glm/gtc/type_ptr.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <string>
 
 namespace fe {
+namespace {
+
+/// @return The icon for a component section, chosen from the component's
+///         name so that new components get a neutral icon without any change.
+const char* iconForComponent(const std::string& name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    auto has = [&](const char* word) { return lower.find(word) != std::string::npos; };
+    if (has("transform")) return FE_ICON_MOVE_3D;
+    if (has("mesh"))      return FE_ICON_CUBOID;
+    if (has("camera"))    return FE_ICON_VIDEO;
+    if (has("light"))     return FE_ICON_LIGHTBULB;
+    return FE_ICON_SLIDERS_HORIZONTAL;
+}
+
+} // namespace
 
 void InspectorPanel::onImGui() {
     ImGui::Begin("Inspector");
@@ -47,14 +69,28 @@ void InspectorPanel::onImGui() {
 
         ImGui::PushID(meta.name.c_str());
 
-        const bool open = ImGui::CollapsingHeader(meta.name.c_str(),
+        // Text after "###" is the section's ID, so the icon in front of the
+        // name never changes which header is which.
+        const std::string header = std::string(iconForComponent(meta.name))
+                                 + "  " + meta.name + "###" + meta.name;
+        // Section headers use neutral greys: the accent colour is kept for
+        // selection, so the headers do not compete with it.
+        ImGui::PushStyleColor(ImGuiCol_Header,        ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
+        ImGui::PushFont(theme::semiBold(), 0.0f);
+        const bool open = ImGui::CollapsingHeader(header.c_str(),
                               ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopFont();
+        ImGui::PopStyleColor(3);
 
         if (meta.removable) {
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x
-                            - ImGui::CalcTextSize("Remove").x - 8.0f);
-            if (ImGui::SmallButton("Remove"))
+            const float buttonWidth = ImGui::CalcTextSize(FE_ICON_X).x
+                                    + ImGui::GetStyle().FramePadding.x * 2.0f;
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - buttonWidth - 4.0f);
+            if (ImGui::SmallButton(FE_ICON_X))
                 meta.remove(m_scene.registry(), m_selected);
+            ImGui::SetItemTooltip("Remove component");
         }
 
         if (open)
@@ -72,7 +108,7 @@ void InspectorPanel::onImGui() {
 
     ImGui::Separator();
 
-    if (ImGui::Button("Add Component", ImVec2(-1, 0)))
+    if (ImGui::Button(FE_ICON_PLUS "  Add Component", ImVec2(-1, 0)))
         ImGui::OpenPopup("##AddComponent");
 
     if (ImGui::BeginPopup("##AddComponent")) {

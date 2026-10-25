@@ -6,6 +6,7 @@
 #include "core/PathUtil.h"
 
 #include <algorithm>
+#include <thread>
 #include <exception>
 #include <string>
 #include <vector>
@@ -128,6 +129,36 @@ void MeshLibrary::shutdown() {
     for (auto& entry : m_abandoned)
         if (entry.control) entry.control->cancelRequested = true;
 
+    // Give them a moment to notice. Not every importer checks the request
+    // often (or at all), and a model read for a thumbnail can be big, so the
+    // wait has a limit: the editor must not hang on exit for one file.
+    const auto allStopped = [this]() {
+        for (const auto& entry : m_pending)
+            if (!isReady(entry.second.future)) return false;
+        for (const auto& entry : m_abandoned)
+            if (!isReady(entry.future)) return false;
+        return true;
+    };
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (!allStopped() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!allStopped()) {
+        FE_WARN("MeshLibrary: an import did not stop in time; leaving it running");
+
+        // Destroying a future that comes from std::async waits for its task,
+        // which is exactly what must not happen now. The unfinished ones are
+        // moved to a list that is never destroyed. The tasks only use their
+        // own data, so they can safely outlive the library.
+        static auto* parked = new std::vector<std::future<std::optional<MeshData>>>();
+        for (auto& entry : m_pending)
+            if (!isReady(entry.second.future)) parked->push_back(std::move(entry.second.future));
+        for (auto& entry : m_abandoned)
+            if (!isReady(entry.future)) parked->push_back(std::move(entry.future));
+        m_importsStillRunning = true;
+    }
+
     m_pending.clear();
     m_abandoned.clear();
 
@@ -205,11 +236,11 @@ void MeshLibrary::beginFrame() {
     });
 }
 
-bool MeshLibrary::ensureLoaded(AssetHandle handle) {
+bool MeshLibrary::ensureLoaded(AssetHandle handle, bool track) {
     // Built-in handles (and "none") are small numbers and always ready.
     if ((handle & kImportedBit) == 0) return true;
 
-    m_used.insert(handle);
+    if (track) m_used.insert(handle);
 
     if (m_imported.count(handle)) return true;
     if (m_failed.count(handle))   return false;

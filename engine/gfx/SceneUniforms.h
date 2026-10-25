@@ -209,9 +209,13 @@ public:
     /// @return The layout of set 0. The mesh pipeline layout is built from it.
     VkDescriptorSetLayout layout() const { return m_layout; }
 
+    /// Index of the extra slot used for renders that are not the editor scene
+    /// (the asset thumbnails). Pass it where a frame index is expected.
+    static constexpr uint32_t kPreviewSlot = Renderer::MAX_FRAMES_IN_FLIGHT;
+
     /**
      * @brief Copies @p data into the buffer of a frame slot.
-     * @param frameIndex Renderer::currentFrameIndex().
+     * @param frameIndex Renderer::currentFrameIndex(), or kPreviewSlot.
      */
     void update(uint32_t frameIndex, const SceneUniformData& data);
 
@@ -230,7 +234,14 @@ private:
     const VulkanContext*  m_ctx    = nullptr;
     VkDescriptorSetLayout m_layout = VK_NULL_HANDLE;
     VkDescriptorPool      m_pool   = VK_NULL_HANDLE;
-    Slot                  m_slots[Renderer::MAX_FRAMES_IN_FLIGHT];
+    Slot                  m_slots[Renderer::MAX_FRAMES_IN_FLIGHT + 1];   // + kPreviewSlot
+
+    /// Maps a frame index to its slot: the preview slot stays itself, any
+    /// other index wraps around the frames in flight.
+    static uint32_t slotFor(uint32_t frameIndex) {
+        return frameIndex == kPreviewSlot ? kPreviewSlot
+                                          : frameIndex % Renderer::MAX_FRAMES_IN_FLIGHT;
+    }
 };
 
 } // namespace fe

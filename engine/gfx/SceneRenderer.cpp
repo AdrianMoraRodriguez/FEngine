@@ -1,14 +1,18 @@
 #include "gfx/SceneRenderer.h"
 
 #include "gfx/OffscreenBuffer.h"
+#include "gfx/Renderer.h"
 #include "core/Log.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
+#include <vector>
 
 namespace fe {
 namespace {
@@ -139,14 +143,21 @@ bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
 
     if (!m_shadowPipeline.init(ctx, ShadowMap::kFormat, shaderDir)) return false;
 
-    return m_pipeline.init(ctx,
-                           OffscreenBuffer::format(),
-                           OffscreenBuffer::depthFormat(),
-                           shaderDir,
-                           m_uniforms.layout());
+    if (!m_pipeline.init(ctx,
+                         OffscreenBuffer::format(),
+                         OffscreenBuffer::depthFormat(),
+                         shaderDir,
+                         m_uniforms.layout())) return false;
+
+    if (!m_outline.init(ctx, OffscreenBuffer::format(), OffscreenBuffer::depthFormat(), shaderDir))
+        return false;
+
+    setupPreviewLighting();
+    return true;
 }
 
 void SceneRenderer::shutdown() {
+    m_outline.shutdown();
     m_pipeline.shutdown();
     m_shadowPipeline.shutdown();
     m_uniforms.shutdown();
@@ -162,6 +173,64 @@ void SceneRenderer::prepare(const Scene& scene) {
     auto view = scene.registry().view<const MeshRenderer>();
     for (auto [entity, renderer] : view.each())
         m_meshes.ensureLoaded(renderer.mesh);
+}
+
+void SceneRenderer::setupPreviewLighting() {
+    // A tiny scene with one light, run through the same code as the editor
+    // scene so the preview is lit by exactly the same shader inputs. It is
+    // uploaded once: the light never changes, so the slot is never rewritten
+    // while the GPU might still be reading it.
+    Scene scene;
+    scene.settings().ambientIntensity = 0.35f;
+
+    const entt::entity key = scene.create("Preview Light");
+
+    LightComponent light;
+    light.type        = LightComponent::Type::Directional;
+    light.intensity   = 1.1f;
+    light.castShadows = false;
+    scene.registry().emplace<LightComponent>(key, light);
+
+    // Light comes from above, a little to the left of the camera (the camera
+    // sits towards +X, +Z, see renderPreview()), so that the faces turned to
+    // the viewer are lit and the others fall into the ambient light.
+    const glm::vec3 towardsLight = glm::normalize(glm::vec3(-0.35f, 0.85f, 0.75f));
+    scene.transform(key).rotation = glm::quatLookAt(-towardsLight, glm::vec3(0.0f, 1.0f, 0.0f));
+    scene.updateTransforms();
+
+    m_uniforms.update(SceneUniforms::kPreviewSlot, gatherLights(scene));
+}
+
+bool SceneRenderer::renderPreview(VkCommandBuffer cmd, AssetHandle handle,
+                                  const OffscreenBuffer& target) {
+    const MeshBuffer*         mesh = m_meshes.get(handle);
+    const std::optional<Aabb> box  = m_meshes.bounds(handle);
+    if (!mesh || !box) return false;
+
+    // The camera looks at the middle of the mesh's bounding sphere, from far
+    // enough that the whole sphere fits the vertical field of view.
+    const glm::vec3 centre = 0.5f * (box->min + box->max);
+    const float     radius = std::max(0.5f * glm::length(box->max - box->min), 1e-4f);
+
+    const float     fovY     = glm::radians(30.0f);
+    const float     distance = radius / std::sin(0.5f * fovY) * 1.05f;
+    const glm::vec3 eye      = centre + glm::normalize(glm::vec3(0.75f, 0.55f, 1.0f)) * distance;
+
+    const glm::mat4 view = glm::lookAt(eye, centre, glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat4 proj = glm::perspective(fovY, 1.0f, distance - 1.5f * radius, distance + 1.5f * radius);
+    proj[1][1] *= -1.0f;   // Vulkan clip space: +Y points down (as in EditorCamera).
+
+    const VkExtent2D extent{target.width(), target.height()};
+
+    Renderer::beginOffscreenPass(cmd, target);
+
+    m_pipeline.bind(cmd, extent);
+    m_pipeline.bindDescriptorSet(cmd, m_uniforms.set(SceneUniforms::kPreviewSlot));
+    m_pipeline.push(cmd, MeshPushConstants{proj * view, glm::mat4(1.0f)});
+    mesh->draw(cmd);
+
+    Renderer::endOffscreenPass(cmd, target);
+    return true;
 }
 
 SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
@@ -580,6 +649,49 @@ void SceneRenderer::render(VkCommandBuffer cmd,
         m_pipeline.push(cmd, pc);
         mesh->draw(cmd);
     }
+}
+
+void SceneRenderer::renderSelectionMask(VkCommandBuffer cmd,
+                                        const Scene& scene,
+                                        entt::entity selected,
+                                        const glm::mat4& viewProj,
+                                        VkExtent2D extent) {
+    m_outlineActive = false;
+    if (selected == entt::null || !scene.registry().valid(selected)) return;
+
+    // The entity and everything below it in the hierarchy, that can be drawn.
+    struct Item { const MeshBuffer* mesh; glm::mat4 world; };
+    std::vector<Item> items;
+
+    std::vector<entt::entity> pending{selected};
+    while (!pending.empty()) {
+        const entt::entity e = pending.back();
+        pending.pop_back();
+
+        if (const auto* renderer = scene.registry().try_get<MeshRenderer>(e)) {
+            const auto* world = scene.registry().try_get<WorldTransform>(e);
+            const MeshBuffer* mesh = m_meshes.get(renderer->mesh);
+            if (world && mesh) items.push_back({mesh, world->matrix});
+        }
+
+        const Relationship& rel = scene.registry().get<Relationship>(e);
+        for (entt::entity child = rel.firstChild; child != entt::null;
+             child = scene.registry().get<Relationship>(child).nextSibling)
+            pending.push_back(child);
+    }
+    if (items.empty()) return;   // a light or a camera, say: no shape to outline
+
+    if (!m_outline.beginMask(cmd, extent)) return;
+    for (const Item& item : items) {
+        m_outline.pushMask(cmd, OutlineMaskPushConstants{viewProj * item.world});
+        item.mesh->draw(cmd);
+    }
+    m_outline.endMask(cmd);
+    m_outlineActive = true;
+}
+
+void SceneRenderer::drawSelectionOutline(VkCommandBuffer cmd, VkExtent2D extent) {
+    if (m_outlineActive) m_outline.draw(cmd, extent);
 }
 
 entt::entity SceneRenderer::pick(const Scene& scene, const Ray& ray,

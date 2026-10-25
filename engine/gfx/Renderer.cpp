@@ -140,7 +140,11 @@ void Renderer::createSwapchain(uint32_t width, uint32_t height) {
     };
 
     auto result = builder
-        .set_desired_format({VK_FORMAT_B8G8R8A8_SRGB,
+        // UNORM on purpose: everything that reaches the swapchain is already
+        // gamma-encoded (the editor colours are authored in sRGB, and the
+        // scene image applies its own gamma in the mesh shader). An *_SRGB
+        // format would encode it a second time and wash everything out.
+        .set_desired_format({VK_FORMAT_B8G8R8A8_UNORM,
                              VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
         .set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
         .set_desired_extent(width, height)

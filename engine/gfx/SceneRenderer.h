@@ -8,6 +8,7 @@
 #include "core/Geometry.h"
 #include "gfx/MeshLibrary.h"
 #include "gfx/MeshPipeline.h"
+#include "gfx/OutlinePass.h"
 #include "gfx/SceneUniforms.h"
 #include "gfx/ShadowCascades.h"
 #include "gfx/ShadowCube.h"
@@ -140,6 +141,56 @@ public:
                 uint32_t frameIndex);
 
     /**
+     * @brief Draws the selected entity's shape into the outline mask.
+     *
+     * The first half of the selection outline; see OutlinePass. Call every
+     * frame, outside any render pass, before the scene pass. The entity's
+     * children are included, so selecting a parent outlines the whole group.
+     * Does nothing if @p selected is null or has no mesh to draw, in which
+     * case drawSelectionOutline() draws nothing either.
+     *
+     * @param cmd      Command buffer from Renderer::currentCommandBuffer().
+     * @param scene    Scene that holds the entity.
+     * @param selected The selected entity, or entt::null.
+     * @param viewProj Combined view-projection matrix of the camera.
+     * @param extent   Size of the render target, which the mask follows.
+     */
+    void renderSelectionMask(VkCommandBuffer cmd,
+                             const Scene& scene,
+                             entt::entity selected,
+                             const glm::mat4& viewProj,
+                             VkExtent2D extent);
+
+    /**
+     * @brief Draws the selection outline over the scene.
+     *
+     * Call inside the scene pass, after render(). Draws nothing unless
+     * renderSelectionMask() found something to outline this frame.
+     */
+    void drawSelectionOutline(VkCommandBuffer cmd, VkExtent2D extent);
+
+    /**
+     * @brief Draws one mesh, framed and lit on its own, into a small target.
+     *
+     * Used for the asset thumbnails. The mesh is seen from a fixed three-quarter
+     * angle, from a distance that fits its bounding sphere in the picture,
+     * under a fixed light, with no shadows. The target is cleared first and
+     * left ready to be sampled as a texture.
+     *
+     * Call outside any render pass, after renderShadows() (the shadow images
+     * must already be in the layout the shader expects). The mesh must be on
+     * the GPU: see MeshLibrary::ensureLoaded().
+     *
+     * @param handle Mesh to draw.
+     * @param target Colour + depth target to draw into.
+     * @return `false` if the mesh is not available; nothing was drawn.
+     */
+    bool renderPreview(VkCommandBuffer cmd, AssetHandle handle, const OffscreenBuffer& target);
+
+    /// @return The outline's settings (colour and thickness).
+    OutlinePass& outline() { return m_outline; }
+
+    /**
      * @brief Finds the nearest renderable entity hit by a ray.
      *
      * Tests the ray against the bounding box of each entity's mesh, using
@@ -158,6 +209,9 @@ public:
     MeshLibrary& meshes() { return m_meshes; }
 
 private:
+    /// Fills the preview slot of the uniforms with the light renderPreview() uses.
+    void setupPreviewLighting();
+
     /// Collects the scene's lights into the block the shaders read. Also
     /// gives each shadow-casting light a shadow map slot (GpuLight::spotCone.z).
     static SceneUniformData gatherLights(const Scene& scene);
@@ -181,6 +235,8 @@ private:
     ShadowPipeline m_shadowPipeline;
     SceneUniforms  m_uniforms;
     MeshPipeline   m_pipeline;
+    OutlinePass    m_outline;
+    bool           m_outlineActive = false;   ///< A mask was drawn this frame.
     MeshLibrary    m_meshes;
 };
 
