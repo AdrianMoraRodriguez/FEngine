@@ -11,6 +11,7 @@
 #include "gfx/Renderer.h"
 #include "gfx/OffscreenBuffer.h"
 #include "gfx/SceneRenderer.h"
+#include "import/AssetDatabase.h"
 #include "gfx/ThumbnailRenderer.h"
 #include "scene/Scene.h"
 #include "scene/ComponentRegistry.h"
@@ -19,12 +20,14 @@
 #include "editor/ImageThumbnails.h"
 #include "import/ImageLoader.h"
 #include "editor/ImageViewerPanel.h"
+#include "editor/ModelViewerPanel.h"
 #include "editor/FileDrop.h"
 #include "editor/EditorTheme.h"
 #include "editor/EditorCamera.h"
 #include "editor/SceneFileController.h"
 #include "editor/HierarchyPanel.h"
 #include "editor/InspectorPanel.h"
+#include "editor/UndoHistory.h"
 #include "editor/ViewportPanel.h"
 #include "editor/StatisticsPanel.h"
 
@@ -144,7 +147,7 @@ void shutdownImGui(VkDevice device) {
 // Dockspace
 // ---------------------------------------------------------------------------
 
-void beginDockspace(fe::SceneFileController& sceneFiles) {
+void beginDockspace(fe::SceneFileController& sceneFiles, fe::UndoHistory& undo) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -174,6 +177,10 @@ void beginDockspace(fe::SceneFileController& sceneFiles) {
             sceneFiles.drawMenuItems();
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) sceneFiles.requestQuit();
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Edit")) {
+            undo.drawMenuItems();
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
@@ -268,9 +275,8 @@ int main() {
 
     fe::SceneRenderer sceneRenderer;
     if (!sceneRenderer.init(vkCtx, shaderDir.string().c_str())) return 1;
-    sceneRenderer.meshes().setAssetRoot(assetsDir);
     fe::assets::setRoot(assetsDir);
-    sceneRenderer.meshes().scanAssets();
+    fe::AssetDatabase::instance().scan();   // reads / creates the .meta files
 
     fe::registerBuiltinComponents();
 
@@ -342,6 +348,7 @@ int main() {
     fe::StatisticsPanel statisticsPanel{scene, renderer, deltaTime, frameCount};
     fe::AssetBrowser    assetBrowser   {assetsDir};
     fe::ImageViewerPanel imageViewer   {vkCtx};
+    fe::ModelViewerPanel modelViewer   {vkCtx, sceneRenderer};
 
     // Small pictures of the models shown in the Asset Browser, drawn on demand.
     fe::ThumbnailRenderer thumbnails;
@@ -358,6 +365,11 @@ int main() {
     fe::SceneFileController sceneFiles{scene, selectedEntity, assetsDir / "scenes"};
     sceneFiles.markClean();
 
+    // Undo and redo. It starts from the scene as it is now, and starts over
+    // whenever New or Open replaces the scene.
+    fe::UndoHistory undoHistory{scene, selectedEntity};
+    sceneFiles.setSceneReplacedCallback([&undoHistory] { undoHistory.reset(); });
+
     fe::Panel* panels[] = {
         &hierarchyPanel,
         &inspectorPanel,
@@ -365,7 +377,17 @@ int main() {
         &statisticsPanel,
         &assetBrowser,
         &imageViewer,
+        &modelViewer,
     };
+
+    // Mouse capture while the camera navigates (right, middle or Alt+left drag).
+    // The OS cursor is hidden and locked, so it stays where the drag began and
+    // can never reach (and highlight) other panels; GLFW still reports how far
+    // the mouse moves, and that movement is what turns the camera. When the
+    // button is released GLFW puts the cursor back where it was.
+    bool   mouseCaptured = false;
+    double captureAnchorX = 0.0, captureAnchorY = 0.0;   // where the cursor was when the capture began
+    double captureLastX   = 0.0, captureLastY   = 0.0;   // the locked cursor's last reported position
 
     // The editor closes once the scene files controller says nothing would be
     // lost (see requestQuit()).
@@ -392,6 +414,37 @@ int main() {
             }
         }
 
+        // Start or end the mouse capture. The camera decides during the ImGui
+        // frame whether a drag is in progress, so this follows it one frame later.
+        float captureDeltaX = 0.0f, captureDeltaY = 0.0f;
+        {
+            const bool wantCapture = editorCamera.isNavigating();
+            if (wantCapture && !mouseCaptured) {
+                glfwGetCursorPos(window.handle(), &captureAnchorX, &captureAnchorY);
+                glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                // In this mode GLFW reports a virtual, unbounded position that
+                // starts where the cursor was.
+                glfwGetCursorPos(window.handle(), &captureLastX, &captureLastY);
+                mouseCaptured = true;
+            } else if (!wantCapture && mouseCaptured) {
+                glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                mouseCaptured = false;
+            }
+
+            if (mouseCaptured) {
+                double x = 0.0, y = 0.0;
+                glfwGetCursorPos(window.handle(), &x, &y);
+                captureDeltaX = static_cast<float>(x - captureLastX);
+                captureDeltaY = static_cast<float>(y - captureLastY);
+                captureLastX = x;
+                captureLastY = y;
+                // For ImGui the pointer has not moved: panels see it parked at
+                // the spot where the drag began.
+                ImGui::GetIO().AddMousePosEvent(static_cast<float>(captureAnchorX),
+                                                static_cast<float>(captureAnchorY));
+            }
+        }
+
         // The window's close button, or Alt+F4: do not let the window close
         // by itself. Ask the controller, which may show the Unsaved Changes
         // dialog first, and keep running until it confirms.
@@ -405,7 +458,11 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        beginDockspace(sceneFiles);
+        // While captured, the camera is driven by the movement GLFW reported.
+        if (mouseCaptured)
+            ImGui::GetIO().MouseDelta = ImVec2(captureDeltaX, captureDeltaY);
+
+        beginDockspace(sceneFiles, undoHistory);
 
         for (auto* panel : panels)
             panel->onImGui();
@@ -422,7 +479,17 @@ int main() {
             if (!imagePath.empty()) imageViewer.open(imagePath);
         }
 
+        // Same for a model: it opens in a viewer tab with its own camera.
+        {
+            const std::filesystem::path modelPath = assetBrowser.takeModelToOpen();
+            if (!modelPath.empty()) modelViewer.open(modelPath);
+        }
+
         sceneFiles.onImGui();   // shortcuts and the Open / Save / Discard dialogs
+
+        // Last, after every panel has had its say: records what the user just
+        // did and handles Ctrl+Z / Ctrl+Y.
+        undoHistory.update();
 
         ImGui::Render();
 
@@ -437,6 +504,7 @@ int main() {
         // Same reason for the thumbnails: finished models are uploaded here.
         thumbnails.update();
         imageThumbnails.update();
+        modelViewer.update();      // finishes loading the models open in viewers
 
         // ----- GPU frame -----
         if (!renderer.beginFrame()) continue;
@@ -458,7 +526,11 @@ int main() {
         const glm::mat4 viewProj = cameraProjection * cameraView;
         const VkExtent2D extent{offscreen.width(), offscreen.height()};
 
-        // 2. The shape of the selected entity, for its outline. Like the
+        // 2. Ambient occlusion: the scene's depth from the camera, and from it
+        //    how closed each pixel is. The scene pass reads the result.
+        sceneRenderer.renderAmbientOcclusion(cmd, scene, viewProj, cameraProjection, extent);
+
+        // 2b. The shape of the selected entity, for its outline. Like the
         //    shadow pass, it opens passes of its own, so it comes first.
         sceneRenderer.renderSelectionMask(cmd, scene, selectedEntity, viewProj, extent);
 
@@ -476,6 +548,9 @@ int main() {
         // 3b. Thumbnails of the models the Asset Browser asked for. Each one
         //     is its own small pass; the pictures appear from the next frame.
         thumbnails.render(cmd);
+
+        // 3c. The models open in viewer tabs, each with its own camera.
+        modelViewer.render(cmd);
 
         // 4. Swapchain pass: ImGui on top (the Viewport panel samples the
         //    offscreen colour image).
@@ -501,6 +576,7 @@ int main() {
     vkDeviceWaitIdle(vkCtx.device());
     lap("waiting for the GPU");
 
+    modelViewer.shutdown();  // its pictures are ImGui textures too
     imageThumbnails.shutdown();
     imageViewer.shutdown();  // same: its pictures are ImGui textures
     thumbnails.shutdown();   // its pictures are ImGui textures: before ImGui goes away

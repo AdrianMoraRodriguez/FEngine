@@ -6,13 +6,21 @@
 #include <assimp/ProgressHandler.hpp>
 #include <assimp/config.h>
 #include <assimp/postprocess.h>
+#include <assimp/GltfMaterial.h>
+#include <assimp/material.h>
 #include <assimp/scene.h>
+#include <assimp/texture.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <initializer_list>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace fe {
 namespace {
@@ -49,6 +57,122 @@ using Clock = std::chrono::steady_clock;
 
 long long millisecondsSince(Clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+}
+
+/// State shared by all the meshes of one file while importing.
+struct ImportContext {
+    std::filesystem::path             directory;       ///< Folder of the model file.
+    std::unordered_map<std::string, int> imageIndex;   ///< Texture name -> index in MeshData::images (-1: unusable).
+    std::unordered_map<unsigned, int>    materialIndex;///< Assimp material -> index in MeshData::materials.
+};
+
+/// Registers the first texture of the given types that the material has.
+/// @return The index in MeshData::images, or -1 if there is none.
+int imageForTypes(const aiScene& scene, const aiMaterial& material,
+                  std::initializer_list<aiTextureType> types,
+                  ImportContext& context, MeshData& out) {
+    aiString name;
+    bool found = false;
+    for (aiTextureType type : types) {
+        if (material.GetTexture(type, 0, &name) == AI_SUCCESS && name.length > 0) { found = true; break; }
+    }
+    if (!found) return -1;
+
+    const std::string key = name.C_Str();
+    if (const auto known = context.imageIndex.find(key); known != context.imageIndex.end())
+        return known->second;
+
+    ImageSource source;
+    source.label = key;
+
+    if (const aiTexture* embedded = scene.GetEmbeddedTexture(key.c_str())) {
+        // Inside the model file. Only compressed images (PNG, JPEG...) are
+        // supported; they are stored with the byte count in mWidth.
+        if (embedded->mHeight == 0 && embedded->pcData && embedded->mWidth > 0) {
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(embedded->pcData);
+            source.encoded = std::make_shared<const std::vector<uint8_t>>(
+                bytes, bytes + embedded->mWidth);
+        } else {
+            FE_WARN("AssimpImporter: embedded raw texture '%s' is not supported", key.c_str());
+        }
+    } else {
+        // A file next to the model. Windows tools write backslashes.
+        std::string text = key;
+        std::replace(text.begin(), text.end(), '\\', '/');
+        std::filesystem::path file = context.directory / std::filesystem::path(std::u8string(
+            reinterpret_cast<const char8_t*>(text.data()), text.size()));
+
+        // Models often point at a folder that no longer exists; the same
+        // file name next to the model is the usual fix.
+        std::error_code ec;
+        if (!std::filesystem::exists(file, ec))
+            file = context.directory / file.filename();
+        source.file = file;
+    }
+
+    int index = -1;
+    if (source.encoded || !source.file.empty()) {
+        index = static_cast<int>(out.images.size());
+        out.images.push_back(std::move(source));
+    }
+    context.imageIndex[key] = index;
+    return index;
+}
+
+/// Registers a material once and returns its index in MeshData::materials.
+int materialFor(const aiScene& scene, unsigned materialIndex,
+                ImportContext& context, MeshData& out) {
+    if (materialIndex >= scene.mNumMaterials) return -1;
+    if (const auto known = context.materialIndex.find(materialIndex); known != context.materialIndex.end())
+        return known->second;
+
+    const aiMaterial& source = *scene.mMaterials[materialIndex];
+    ModelMaterial material;
+
+    // glTF-style "base colour" first, then the classic "diffuse" slot.
+    material.albedo   = imageForTypes(scene, source, {aiTextureType_BASE_COLOR, aiTextureType_DIFFUSE}, context, out);
+    material.normal   = imageForTypes(scene, source, {aiTextureType_NORMALS, aiTextureType_NORMAL_CAMERA}, context, out);
+    material.emissive = imageForTypes(scene, source, {aiTextureType_EMISSIVE, aiTextureType_EMISSION_COLOR}, context, out);
+
+    // Formats that know metalness and roughness say so; the old ones only have
+    // a "shininess" exponent, which converts to a roughness.
+    float value = 0.0f;
+    if (source.Get(AI_MATKEY_METALLIC_FACTOR, value) == AI_SUCCESS)
+        material.metallic = value;
+    if (source.Get(AI_MATKEY_ROUGHNESS_FACTOR, value) == AI_SUCCESS) {
+        material.roughness = value;
+    } else if (source.Get(AI_MATKEY_SHININESS, value) == AI_SUCCESS) {
+        material.roughness = std::clamp(std::sqrt(2.0f / (std::max(value, 0.0f) + 2.0f)), 0.1f, 1.0f);
+    }
+
+    aiColor3D emissive(0.0f, 0.0f, 0.0f);
+    if (source.Get(AI_MATKEY_COLOR_EMISSIVE, emissive) == AI_SUCCESS)
+        material.emissiveFactor = glm::vec3(emissive.r, emissive.g, emissive.b);
+
+    // Transparency: glTF files say it outright; the older formats only have an
+    // opacity number (below 1, the surface is see-through).
+    aiString gltfMode;
+    if (source.Get(AI_MATKEY_GLTF_ALPHAMODE, gltfMode) == AI_SUCCESS) {
+        const std::string mode = gltfMode.C_Str();
+        if (mode == "MASK")       material.alphaMode = AlphaMode::Mask;
+        else if (mode == "BLEND") material.alphaMode = AlphaMode::Blend;
+        float cutoff = 0.5f;
+        if (source.Get(AI_MATKEY_GLTF_ALPHACUTOFF, cutoff) == AI_SUCCESS)
+            material.alphaCutoff = cutoff;
+    }
+    float opacity = 1.0f;
+    if (source.Get(AI_MATKEY_OPACITY, opacity) == AI_SUCCESS && opacity < 1.0f) {
+        material.opacity = std::clamp(opacity, 0.0f, 1.0f);
+        if (material.alphaMode == AlphaMode::Opaque) material.alphaMode = AlphaMode::Blend;
+    }
+    int twoSided = 0;
+    if (source.Get(AI_MATKEY_TWOSIDED, twoSided) == AI_SUCCESS)
+        material.doubleSided = twoSided != 0;
+
+    const int index = static_cast<int>(out.materials.size());
+    out.materials.push_back(material);
+    context.materialIndex[materialIndex] = index;
+    return index;
 }
 
 } // namespace
@@ -118,6 +242,9 @@ std::optional<MeshData> importWithAssimp(const std::filesystem::path& file,
 
     size_t convertedVertices = 0;
 
+    ImportContext context;
+    context.directory = file.parent_path();
+
     for (unsigned m = 0; m < scene->mNumMeshes; ++m) {
         const aiMesh* mesh = scene->mMeshes[m];
         if (!mesh->HasPositions() || mesh->mNumFaces == 0) continue;
@@ -131,11 +258,15 @@ std::optional<MeshData> importWithAssimp(const std::filesystem::path& file,
                 baseColor = glm::vec3(diffuse.r, diffuse.g, diffuse.b);
         }
 
+        const int material = materialFor(*scene, mesh->mMaterialIndex, context, result);
+        const bool textured = material >= 0 && result.materials[material].albedo >= 0;
+
         // A black diffuse colour usually means "the colour comes from a
-        // texture", which we do not load yet. Black would make the model
-        // invisible against the dark background, so fall back to the default.
+        // texture". Black would make the model invisible, so fall back to
+        // white under a texture (it is multiplied with it) and to the default
+        // grey otherwise.
         if (glm::dot(baseColor, baseColor) < 1e-6f)
-            baseColor = kDefaultColor;
+            baseColor = textured ? glm::vec3(1.0f) : kDefaultColor;
 
         const uint32_t baseVertex = static_cast<uint32_t>(result.vertices.size());
 
@@ -183,6 +314,8 @@ std::optional<MeshData> importWithAssimp(const std::filesystem::path& file,
         }
         convertedVertices += mesh->mNumVertices;
 
+        const uint32_t firstIndex = static_cast<uint32_t>(result.indices.size());
+
         for (unsigned f = 0; f < mesh->mNumFaces; ++f) {
             const aiFace& face = mesh->mFaces[f];
             if (face.mNumIndices != 3) continue;   // already triangulated; defensive
@@ -190,6 +323,8 @@ std::optional<MeshData> importWithAssimp(const std::filesystem::path& file,
             for (unsigned i = 0; i < 3; ++i)
                 result.indices.push_back(baseVertex + face.mIndices[i]);
         }
+
+        result.addPart(firstIndex, static_cast<uint32_t>(result.indices.size()) - firstIndex, material);
     }
 
     if (result.vertices.empty() || result.indices.empty()) {

@@ -1,5 +1,6 @@
 #include "gfx/OutlinePass.h"
 
+#include "gfx/OffscreenBuffer.h"
 #include "gfx/VulkanContext.h"
 #include "gfx/Vertex.h"
 #include "core/Log.h"
@@ -399,7 +400,7 @@ bool OutlinePass::createOutlinePipeline(VkFormat colorFormat, VkFormat depthForm
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisampling.rasterizationSamples = OffscreenBuffer::kSampleCount;   // drawn inside the (multisampled) scene pass
 
     // The scene pass has a depth attachment, so the pipeline must declare its
     // format, but the outline neither tests nor writes depth: it is drawn over

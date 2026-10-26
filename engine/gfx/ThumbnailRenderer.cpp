@@ -14,6 +14,8 @@ ThumbnailRenderer::~ThumbnailRenderer() { shutdown(); }
 void ThumbnailRenderer::init(const VulkanContext& ctx, SceneRenderer& scenes) {
     m_ctx    = &ctx;
     m_scenes = &scenes;
+    if (!m_scratch.init(ctx, kSize, kSize))
+        FE_ERROR("ThumbnailRenderer: cannot create the shared multisampled images");
 }
 
 void ThumbnailRenderer::shutdown() {
@@ -21,6 +23,7 @@ void ThumbnailRenderer::shutdown() {
         if (entry.picture) entry.picture->shutdown();
 
     m_entries.clear();
+    m_scratch.shutdown();   // after the pictures that borrow from it
     m_pending.clear();
     m_pictures = 0;
     m_ctx      = nullptr;
@@ -99,7 +102,7 @@ void ThumbnailRenderer::update() {
                     continue;
                 }
                 entry.picture = std::make_unique<OffscreenBuffer>();
-                if (!entry.picture->init(*m_ctx, kSize, kSize)) {
+                if (!entry.picture->init(*m_ctx, kSize, kSize, &m_scratch)) {
                     entry.picture.reset();
                     entry.state = State::Unavailable;
                     continue;
@@ -112,7 +115,8 @@ void ThumbnailRenderer::update() {
             }
         }
 
-        if (entry.state == State::Loading || entry.state == State::Ready)
+        if (entry.state == State::Loading || entry.state == State::Ready ||
+            (entry.state == State::Drawn && entry.refine))
             stillPending.push_back(key);
     }
 
@@ -127,10 +131,16 @@ void ThumbnailRenderer::render(VkCommandBuffer cmd) {
         if (drawn >= kMaxDrawnPerFrame) break;
 
         Entry& entry = m_entries.at(key);
-        if (entry.state != State::Ready) continue;
+        const bool redraw = (entry.state == State::Drawn && entry.refine);
+        if (entry.state != State::Ready && !redraw) continue;
 
-        if (m_scenes->renderPreview(cmd, entry.handle, *entry.picture)) {
-            entry.state = State::Drawn;
+        bool settled = true;
+        if (m_scenes->renderPreview(cmd, entry.handle, *entry.picture, &settled)) {
+            entry.state    = State::Drawn;
+            ++entry.attempts;
+            entry.refine   = !settled && entry.attempts < kMaxRefineFrames;
+        } else if (redraw) {
+            entry.refine = false;    // it keeps the picture it has
         } else {
             entry.picture.reset();   // it was never drawn, so nothing uses it yet
             --m_pictures;
@@ -142,8 +152,8 @@ void ThumbnailRenderer::render(VkCommandBuffer cmd) {
     // Drawn and unavailable thumbnails need no more work.
     m_pending.erase(std::remove_if(m_pending.begin(), m_pending.end(),
         [this](const std::string& key) {
-            const State state = m_entries.at(key).state;
-            return state == State::Drawn || state == State::Unavailable;
+            const Entry& entry = m_entries.at(key);
+            return (entry.state == State::Drawn && !entry.refine) || entry.state == State::Unavailable;
         }), m_pending.end());
 }
 

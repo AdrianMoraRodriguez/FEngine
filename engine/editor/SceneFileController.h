@@ -10,6 +10,7 @@
 #include <entt/entt.hpp>
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,10 @@ public:
     /// @return `true` if the scene differs from the last saved version.
     bool isDirty() const;
 
+    /// Sets a function to call right after New or Open has replaced the scene
+    /// (the undo history uses it to start over).
+    void setSceneReplacedCallback(std::function<void()> callback) { m_onSceneReplaced = std::move(callback); }
+
 private:
     /// Action waiting for the user to confirm discarding unsaved changes.
     enum class Action { None, New, Open, Quit };
@@ -131,6 +136,8 @@ private:
     bool m_requestUnsavedDialog = false;
 
     bool m_quitConfirmed = false;   ///< Set once the editor is allowed to close.
+
+    std::function<void()> m_onSceneReplaced;   ///< Called after New and Open.
 
     Action                m_pendingAction = Action::None;
     std::filesystem::path m_pendingPath;

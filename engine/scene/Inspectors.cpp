@@ -78,47 +78,69 @@ bool inspect(MeshRenderer& m) {
         ImGui::EndCombo();
     }
 
-    if (m.mesh > builtin::MeshPlane)
-        ImGui::TextDisabled("Asset id: %llx", static_cast<unsigned long long>(m.mesh));
+    if (m.mesh > builtin::MeshPlane) {
+        // Shown by its current path; the scene stores the id, so the file may
+        // be moved or renamed freely.
+        const std::string path = AssetDatabase::instance().pathOf(m.mesh);
+        if (path.empty())
+            ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.40f, 1.0f), "Missing model (id %llx)",
+                               static_cast<unsigned long long>(m.mesh));
+        else
+            ImGui::TextDisabled("%s", path.c_str());
+    }
 
     ImGui::Text("Material : %llu", m.material);
     changed |= ImGui::Checkbox("Cast Shadows", &m.castShadows);
     return changed;
 }
 
-bool inspect(MaterialComponent& m) {
+namespace {
+
+/// One texture slot of the material: a wide button with the image's path that
+/// an image dragged from the Asset Browser can be dropped on, and a button to
+/// empty the slot. The drop target belongs to the last item, so it comes right
+/// after the button.
+///
+/// @param label  Name shown at the left.
+/// @param id     Unique ImGui id for the slot's widgets.
+/// @param handle The slot's image id; 0 means none.
+/// @param empty  Text of an empty slot.
+/// @return `true` if the slot changed.
+bool textureSlot(const char* label, const char* id, AssetHandle& handle, const char* empty) {
     bool changed = false;
+    ImGui::PushID(id);
 
-    changed |= ImGui::ColorEdit3("Base Color", glm::value_ptr(m.baseColor));
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(96.0f);
 
-    // ---- Albedo texture slot ----
-    // A wide button that shows the file name. Images dragged from the Asset
-    // Browser can be dropped on it. The drop target belongs to the last item,
-    // so it comes right after the button.
-    ImGui::TextUnformatted("Albedo");
-    ImGui::SameLine();
-
-    const bool  hasTexture = !m.albedoTexture.empty();
+    const bool  hasTexture = (handle != 0);
     const float clearWidth = ImGui::GetFrameHeight();
-    const float slotWidth  = ImGui::GetContentRegionAvail().x - (hasTexture ? clearWidth + ImGui::GetStyle().ItemSpacing.x : 0.0f);
+    const float slotWidth  = ImGui::GetContentRegionAvail().x -
+                             (hasTexture ? clearWidth + ImGui::GetStyle().ItemSpacing.x : 0.0f);
 
-    std::string label = hasTexture ? m.albedoTexture : std::string("None (drop an image)");
-    label += "##albedo";
-    ImGui::Button(label.c_str(), ImVec2(slotWidth, 0.0f));
+    // The slot holds an id; what the user sees is where that image is now.
+    std::string path;
+    if (hasTexture) {
+        path = AssetDatabase::instance().pathOf(handle);
+        if (path.empty()) path = "(missing image)";
+    }
 
+    const std::string text = (hasTexture ? path : std::string(empty)) + "##slot";
+    ImGui::Button(text.c_str(), ImVec2(slotWidth, 0.0f));
     if (hasTexture && ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", m.albedoTexture.c_str());
+        ImGui::SetTooltip("%s", path.c_str());
 
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FE_IMAGE")) {
             // The Asset Browser sends the path as UTF-8 text.
             const std::filesystem::path file(std::u8string(
                 reinterpret_cast<const char8_t*>(payload->Data)));
-            const std::string relative = assets::toRelative(file);
-            if (relative.empty()) {
-                FE_WARN("Material: '%s' is not inside the asset folder", toUtf8(file).c_str());
+            const AssetHandle dropped = AssetDatabase::instance().idFor(file);
+            if (dropped == 0) {
+                FE_WARN("Material: '%s' is not an image inside the asset folder",
+                        toUtf8(file).c_str());
             } else {
-                m.albedoTexture = relative;
+                handle  = dropped;
                 changed = true;
             }
         }
@@ -127,11 +149,72 @@ bool inspect(MaterialComponent& m) {
 
     if (hasTexture) {
         ImGui::SameLine();
-        if (ImGui::Button(FE_ICON_X "##clearAlbedo", ImVec2(clearWidth, 0.0f))) {
-            m.albedoTexture.clear();
+        if (ImGui::Button(FE_ICON_X "##clear", ImVec2(clearWidth, 0.0f))) {
+            handle  = 0;
             changed = true;
         }
     }
+
+    ImGui::PopID();
+    return changed;
+}
+
+} // namespace
+
+bool inspect(MaterialComponent& m) {
+    bool changed = false;
+
+    changed |= ImGui::ColorEdit3("Base Color", glm::value_ptr(m.baseColor));
+
+    // A slot left empty keeps the model's own texture for it.
+    ImGui::SeparatorText("Textures");
+    changed |= textureSlot("Albedo",      "albedo",     m.albedoTexture,     "Model's own (drop an image)");
+    changed |= textureSlot("Metal/Rough", "metalrough", m.metalRoughTexture, "Model's own (green: roughness, blue: metal)");
+    changed |= textureSlot("Normal",      "normal",     m.normalTexture,     "Model's own (drop a normal map)");
+    changed |= textureSlot("Emissive",    "emissive",   m.emissiveTexture,   "Model's own (drop an image)");
+
+    ImGui::SeparatorText("Surface");
+    changed |= ImGui::Checkbox("Custom Surface", &m.customSurface);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Off: the model's own metalness, roughness and emissive values.\n"
+                          "On: the values below replace them on every part of the object.");
+
+    if (m.customSurface) {
+        changed |= ImGui::SliderFloat("Metallic",  &m.metallic,  0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Roughness", &m.roughness, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::DragFloat("Normal Strength", &m.normalStrength, 0.01f, 0.0f, 4.0f, "%.2f");
+        changed |= ImGui::ColorEdit3("Emissive Colour", glm::value_ptr(m.emissiveColor));
+        changed |= ImGui::DragFloat("Emissive Intensity", &m.emissiveIntensity, 0.05f, 0.0f, 100.0f, "%.2f");
+        m.normalStrength    = std::max(m.normalStrength, 0.0f);
+        m.emissiveIntensity = std::max(m.emissiveIntensity, 0.0f);
+    } else {
+        ImGui::TextDisabled("Using the model's own values.");
+    }
+
+    ImGui::SeparatorText("Transparency");
+    const char* modes[] = {"Model's own", "Opaque", "Cutout", "Blend"};
+    int mode = static_cast<int>(m.transparency);
+    if (ImGui::Combo("Mode", &mode, modes, 4)) {
+        m.transparency = static_cast<MaterialComponent::Transparency>(mode);
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Model's own: what the model says (solid for the built-in shapes).\n"
+                          "Opaque: ignores the albedo's alpha.\n"
+                          "Cutout: pixels with little alpha are not drawn (leaves, fences).\n"
+                          "Blend: see-through, mixed with what is behind (glass, water).\n"
+                          "Translucent objects do not cast shadows or ambient occlusion.");
+    if (m.transparency == MaterialComponent::Transparency::Cutout) {
+        changed |= ImGui::SliderFloat("Alpha Cutoff", &m.alphaCutoff, 0.0f, 1.0f, "%.2f");
+    }
+    if (m.transparency != MaterialComponent::Transparency::Opaque) {
+        changed |= ImGui::SliderFloat("Opacity", &m.opacity, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Multiplies the albedo's alpha. It only shows on Blend (and Cutout, where it lowers the alpha the cutoff is compared with).");
+    }
+    changed |= ImGui::Checkbox("Double Sided", &m.doubleSided);
+    m.alphaCutoff = std::clamp(m.alphaCutoff, 0.0f, 1.0f);
+    m.opacity     = std::clamp(m.opacity, 0.0f, 1.0f);
 
     return changed;
 }

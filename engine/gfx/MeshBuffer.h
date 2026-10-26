@@ -52,8 +52,24 @@ public:
     /// Destroys the GPU buffers. Safe to call if upload() was never called.
     void destroy();
 
-    /// Binds the vertex buffer and index buffer, then records a draw call.
+    /// Binds the vertex buffer and index buffer, then records a draw call
+    /// for the whole mesh.
     void draw(VkCommandBuffer cmd) const;
+
+    /// Binds the vertex and index buffers without drawing. Use it before one
+    /// or more drawRange() calls.
+    void bind(VkCommandBuffer cmd) const;
+
+    /**
+     * @brief Records a draw call for part of the mesh.
+     *
+     * bind() must have been called on this mesh first. A model made of
+     * several materials is drawn as one range per material.
+     *
+     * @param firstIndex Position of the first index to draw.
+     * @param indexCount Number of indices (three per triangle).
+     */
+    void drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount) const;
 
     /// @return true if the buffers have been successfully uploaded.
     bool isValid() const { return m_vertexBuffer != VK_NULL_HANDLE; }

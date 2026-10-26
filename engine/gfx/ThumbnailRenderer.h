@@ -23,7 +23,8 @@
  * load all of them.
  *
  * Limits, to keep a big folder from eating the machine:
- *   - kMaxThumbnails pictures at most (about 128 KB each).
+ *   - kMaxThumbnails pictures at most (about 64 KB each, plus one shared set of
+ *     multisampled images).
  *   - Model files bigger than kMaxFileBytes keep their icon.
  *   - At most kMaxLoading models are being read at once, and kMaxDrawnPerFrame
  *     pictures are drawn per frame.
@@ -62,6 +63,7 @@ class VulkanContext;
 class ThumbnailRenderer {
 public:
     static constexpr uint32_t       kSize           = 128;   ///< Side of a thumbnail, in pixels.
+    static constexpr std::uint32_t  kMaxRefineFrames = 600;   ///< Redraws before giving up on a texture that never arrives.
     static constexpr std::size_t    kMaxThumbnails  = 256;   ///< Most pictures kept at once.
     static constexpr std::uintmax_t kMaxFileBytes   = 64ull * 1024 * 1024;
     static constexpr std::size_t    kMaxLoading     = 2;     ///< Models read at the same time.
@@ -126,7 +128,7 @@ private:
         Queued,       ///< Asked for; not started.
         Loading,      ///< The model is being read or uploaded.
         Ready,        ///< The model is on the GPU; the picture is not drawn yet.
-        Drawn,        ///< The picture exists and can be shown.
+        Drawn,        ///< The picture exists and can be shown (see Entry::refine).
         Unavailable   ///< Will never exist (too big, failed, over the limit).
     };
 
@@ -136,10 +138,22 @@ private:
         AssetHandle                      handle = 0;
         std::unique_ptr<OffscreenBuffer> picture;
         std::uint64_t                    lastRequested = 0;   ///< Frame of the last request().
+
+        /// The picture was drawn while some texture was still loading, so it
+        /// shows plain colours. It is shown anyway and redrawn every frame until
+        /// the textures are in, or kMaxRefineFrames have passed.
+        bool          refine   = false;
+        std::uint32_t attempts = 0;   ///< Redraws so far.
     };
 
     const VulkanContext* m_ctx    = nullptr;
     SceneRenderer*       m_scenes = nullptr;
+
+    /// The multisampled images every picture is drawn through, one after the
+    /// other, instead of each keeping its own (that would be several times
+    /// the size of the pictures themselves). Never shown. Declared before the
+    /// pictures, which borrow from it.
+    OffscreenBuffer m_scratch;
 
     std::unordered_map<std::string, Entry> m_entries;   ///< By UTF-8 path.
     std::vector<std::string>               m_pending;   ///< Keys still on their way, oldest first.

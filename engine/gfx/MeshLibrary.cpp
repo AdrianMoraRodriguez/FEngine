@@ -16,17 +16,12 @@ namespace {
 
 /// Top bit of an imported model's handle. Built-in handles are small numbers,
 /// so this bit tells the two kinds apart at a glance.
-constexpr AssetHandle kImportedBit = 0x8000000000000000ull;
+constexpr AssetHandle kImportedBit = AssetDatabase::kIdBit;
 
-/// Handle for a model: a 64-bit FNV-1a hash of its relative path.
-/// The same path always gives the same handle, on any machine.
-AssetHandle hashPath(const std::string& relativePath) {
-    uint64_t hash = 14695981039346656037ull;
-    for (unsigned char c : relativePath) {
-        hash ^= c;
-        hash *= 1099511628211ull;
-    }
-    return hash | kImportedBit;
+/// Where a model is now, for log messages.
+std::string nameOf(AssetHandle handle) {
+    std::string path = AssetDatabase::instance().pathOf(handle);
+    return path.empty() ? std::string("(unknown model)") : path;
 }
 
 /// Bounding box of a vertex set, padded so flat meshes keep some thickness.
@@ -179,52 +174,13 @@ void MeshLibrary::shutdown() {
 // Imported models
 // ---------------------------------------------------------------------------
 
-void MeshLibrary::setAssetRoot(std::filesystem::path root) {
-    m_assetRoot = std::move(root);
-}
-
 AssetHandle MeshLibrary::registerModel(const std::filesystem::path& file) {
-    std::error_code ec;
-    const std::filesystem::path relative =
-        std::filesystem::relative(file, m_assetRoot, ec);
-
-    // A path that has to climb out of the asset root ("..") is not a project asset.
-    if (ec || relative.empty() || *relative.begin() == "..") {
-        FE_WARN("MeshLibrary: '%s' is not inside the asset folder", toUtf8(file).c_str());
+    const AssetHandle handle = AssetDatabase::instance().idFor(file);
+    if (handle == 0) {
+        FE_WARN("MeshLibrary: '%s' is not a model inside the asset folder", toUtf8(file).c_str());
         return builtin::MeshNone;
     }
-
-    const AssetHandle handle = hashPath(toGenericUtf8(relative));
-    m_sources[handle] = relative;
     return handle;
-}
-
-void MeshLibrary::scanAssets() {
-    std::error_code ec;
-    if (m_assetRoot.empty() || !std::filesystem::exists(m_assetRoot, ec)) return;
-
-    // The iterator is advanced with increment(ec) instead of the range-for
-    // operator++, because that one throws if a single entry cannot be read
-    // (a name too long for Windows, a locked folder...). One bad file must
-    // not stop the editor from starting.
-    size_t found = 0;
-    std::filesystem::recursive_directory_iterator it(
-        m_assetRoot, std::filesystem::directory_options::skip_permission_denied, ec);
-    const std::filesystem::recursive_directory_iterator end;
-
-    for (; !ec && it != end; it.increment(ec)) {
-        std::error_code entryEc;
-        if (it->is_regular_file(entryEc) && isSupportedModel(it->path())) {
-            registerModel(it->path());
-            ++found;
-        }
-    }
-
-    if (ec)
-        FE_WARN("MeshLibrary: stopped scanning assets early: %s", ec.message().c_str());
-
-    FE_INFO("MeshLibrary: found %zu model file(s) in '%s'",
-            found, toUtf8(m_assetRoot).c_str());
 }
 
 void MeshLibrary::beginFrame() {
@@ -273,11 +229,19 @@ bool MeshLibrary::ensureLoaded(AssetHandle handle, bool track) {
         }
         entry->second.bounds = computeBounds(data->vertices);
 
+        // A model without material information is one range, no texture.
+        entry->second.parts.parts = std::move(data->parts);
+        if (entry->second.parts.parts.empty())
+            entry->second.parts.parts.push_back(
+                {0, static_cast<uint32_t>(data->indices.size()), -1});
+        entry->second.parts.materials = std::move(data->materials);
+        entry->second.parts.images    = std::move(data->images);
+
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started);
 
         FE_INFO("Imported '%s': %zu vertices, %zu triangles, in %lld ms",
-                toGenericUtf8(m_sources[handle]).c_str(),
+                nameOf(handle).c_str(),
                 data->vertices.size(), data->indices.size() / 3,
                 static_cast<long long>(elapsed.count()));
         return true;
@@ -287,21 +251,20 @@ bool MeshLibrary::ensureLoaded(AssetHandle handle, bool track) {
     if (m_declined.count(handle)) return false;
 
     // ---- Not started yet: find the file and start reading it ----
-    const auto source = m_sources.find(handle);
-    if (source == m_sources.end()) {
-        FE_WARN("MeshLibrary: no model is registered for mesh %llx "
-                "(was the file moved or deleted?)",
+    // The database knows where the model is NOW, even if it was moved or
+    // renamed after the scene was saved.
+    const std::filesystem::path file = AssetDatabase::instance().fullPathOf(handle);
+    if (file.empty()) {
+        FE_WARN("MeshLibrary: no model has id %llx (was the file deleted?)",
                 static_cast<unsigned long long>(handle));
         m_failed.insert(handle);
         return false;
     }
 
-    const std::filesystem::path file = m_assetRoot / source->second;
-
     std::error_code sizeEc;
     const std::uintmax_t bytes = std::filesystem::file_size(file, sizeEc);
 
-    FE_INFO("Importing '%s' (%.1f MB)...", toGenericUtf8(source->second).c_str(),
+    FE_INFO("Importing '%s' (%.1f MB)...", nameOf(handle).c_str(),
             sizeEc ? 0.0 : static_cast<double>(bytes) / (1024.0 * 1024.0));
 
     PendingImport job;
@@ -338,9 +301,8 @@ std::vector<ImportStatus> MeshLibrary::importStatuses() const {
         ImportStatus status;
         status.handle = handle;
 
-        const auto source = m_sources.find(handle);
-        status.name = (source != m_sources.end()) ? toUtf8(source->second.filename())
-                                                  : std::string("(unknown model)");
+        const std::filesystem::path file = AssetDatabase::instance().fullPathOf(handle);
+        status.name = file.empty() ? std::string("(unknown model)") : toUtf8(file.filename());
 
         if (const auto pending = m_pending.find(handle); pending != m_pending.end()) {
             status.state    = ImportState::Loading;
@@ -377,7 +339,7 @@ void MeshLibrary::cancelImport(AssetHandle handle) {
         // result is thrown away by beginFrame() once it is ready.
         m_abandoned.push_back({std::move(pending->second.future), pending->second.control});
         m_pending.erase(pending);
-        FE_INFO("Import of '%s' cancelled", toGenericUtf8(m_sources[handle]).c_str());
+        FE_INFO("Import of '%s' cancelled", nameOf(handle).c_str());
     }
 
     m_declined.insert(handle);
@@ -398,6 +360,11 @@ const MeshBuffer* MeshLibrary::get(AssetHandle handle) const {
                        ? &it->second.buffer : nullptr;
         }
     }
+}
+
+const ModelParts* MeshLibrary::parts(AssetHandle handle) const {
+    const auto it = m_imported.find(handle);
+    return it != m_imported.end() ? &it->second.parts : nullptr;
 }
 
 std::optional<Aabb> MeshLibrary::bounds(AssetHandle handle) const {

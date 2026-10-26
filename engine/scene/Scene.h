@@ -26,11 +26,40 @@ struct SceneSettings {
     /// Brightness of the ambient light. The ambient light's final colour is
     /// ambientColor * ambientIntensity.
     float ambientIntensity = 0.25f;
+
+    /// The panorama that lights the scene and shows behind it: the id of an
+    /// image in the asset folder (a Radiance .hdr gives the best result, as it
+    /// can hold the sun's real brightness), or 0 for the built-in sky.
+    /// This light comes on top of the ambient light above.
+    AssetHandle environment = 0;
+
+    /// Brightness of the environment's light (and of the sky shown behind the
+    /// scene). 0 turns the environment's light off.
+    float environmentIntensity = 1.0f;
+
+    /// Whether the environment is drawn as the background of the scene. Turning
+    /// it off leaves the clear colour; the environment still lights the objects.
+    bool showSky = true;
+
+    /// Whether ambient occlusion darkens the ambient and sky light in creases
+    /// and under objects (see AmbientOcclusion).
+    bool ambientOcclusion = true;
+
+    /// How far from a surface, in world units, nearby geometry still counts
+    /// as blocking its light. Small values give tight contact shadows, large
+    /// ones broad darkening.
+    float aoRadius = 0.5f;
+
+    /// Strength of the occlusion: 1 is the plain estimate, more darkens the
+    /// occluded parts further, 0 turns the effect off.
+    float aoIntensity = 1.5f;
 };
 
 // The WITH_DEFAULT variant fills in any key the file does not have, so a scene
 // file saved before a setting existed still loads.
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SceneSettings, ambientColor, ambientIntensity)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SceneSettings, ambientColor, ambientIntensity,
+                                                environment, environmentIntensity, showSky,
+                                                ambientOcclusion, aoRadius, aoIntensity)
 
 /**
  * @brief A scene: a collection of entities with components.
@@ -52,7 +81,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SceneSettings, ambientColor, amb
  */
 class Scene {
 public:
-    Scene()  = default;
+    /// Makes every entity that gets a MeshRenderer get a MaterialComponent too
+    /// (see Scene.cpp), so an object is always ready to be tinted or textured.
+    Scene();
     ~Scene() = default;
 
     Scene(const Scene&)            = delete;

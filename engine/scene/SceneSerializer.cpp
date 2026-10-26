@@ -4,6 +4,7 @@
 #include "core/Log.h"
 
 #include <fstream>
+#include <iterator>
 
 namespace fe {
 namespace {
@@ -89,16 +90,26 @@ bool SceneSerializer::loadFromFile(Scene& scene,
         return false;
     }
 
+    const std::string text((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
+    if (!loadFromString(scene, text, path.string())) return false;
+
+    FE_INFO("Scene '%s' loaded from '%s'",
+            scene.name().c_str(), path.string().c_str());
+    return true;
+}
+
+bool SceneSerializer::loadFromString(Scene& scene, const std::string& text,
+                                     const std::string& label) {
     // Any malformed or incomplete content surfaces as a json::exception
     // (missing keys, wrong types), so the whole load is guarded: a bad file
     // must be rejected, never crash the editor.
     try {
-        json in;
-        file >> in;
+        const json in = json::parse(text);
 
         if (in.value("version", 0) != 1) {
             FE_ERROR("SceneSerializer: unsupported scene version in '%s'",
-                     path.string().c_str());
+                     label.c_str());
             return false;
         }
 
@@ -139,12 +150,10 @@ bool SceneSerializer::loadFromFile(Scene& scene,
         }
     } catch (const json::exception& ex) {
         FE_ERROR("SceneSerializer: invalid scene file '%s': %s",
-                 path.string().c_str(), ex.what());
+                 label.c_str(), ex.what());
         return false;
     }
 
-    FE_INFO("Scene '%s' loaded from '%s'",
-            scene.name().c_str(), path.string().c_str());
     return true;
 }
 

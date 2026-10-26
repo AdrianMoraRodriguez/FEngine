@@ -365,8 +365,11 @@ VkCommandBuffer Renderer::currentCommandBuffer() const {
 
 void Renderer::beginOffscreenPass(VkCommandBuffer cmd,
                                   const OffscreenBuffer& offscreen) {
-    // Both images are cleared every frame, so UNDEFINED as the old layout
-    // (discard previous contents) is correct for each.
+    // Every image is cleared or overwritten each frame, so UNDEFINED as the old
+    // layout (discard previous contents) is correct for each.
+    transitionImage(cmd, offscreen.msaaImage(),
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     transitionImage(cmd, offscreen.image(),
                     VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -378,10 +381,16 @@ void Renderer::beginOffscreenPass(VkCommandBuffer cmd,
 
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAttachment.imageView   = offscreen.imageView();
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    // Draw into the multisampled image; at the end of the pass the samples
+    // of each pixel are averaged into the ordinary image, which is what is
+    // kept. The multisampled one is not stored.
+    colorAttachment.imageView          = offscreen.msaaView();
+    colorAttachment.imageLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
+    colorAttachment.resolveImageView   = offscreen.imageView();
+    colorAttachment.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp             = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp            = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     colorAttachment.clearValue.color = {{0.18f, 0.18f, 0.22f, 1.0f}};
 
     VkRenderingAttachmentInfo depthAttachment{};

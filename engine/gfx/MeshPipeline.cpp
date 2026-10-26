@@ -1,5 +1,6 @@
 #include "gfx/MeshPipeline.h"
 
+#include "gfx/OffscreenBuffer.h"
 #include "gfx/VulkanContext.h"
 #include "gfx/Vertex.h"
 #include "core/Log.h"
@@ -65,7 +66,10 @@ bool MeshPipeline::init(const VulkanContext& ctx,
                         VkFormat depthFormat,
                         const char* shaderDir,
                         VkDescriptorSetLayout sceneLayout,
-                        VkDescriptorSetLayout materialLayout) {
+                        VkDescriptorSetLayout materialLayout,
+                        VkDescriptorSetLayout environmentLayout,
+                        VkDescriptorSetLayout occlusionLayout,
+                        bool translucent) {
     m_ctx = &ctx;
 
     // ---- Shader modules ----
@@ -118,14 +122,14 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     VkPipelineRasterizationStateCreateInfo rasteriser{};
     rasteriser.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasteriser.polygonMode = VK_POLYGON_MODE_FILL;
-    rasteriser.cullMode    = VK_CULL_MODE_BACK_BIT;
+    rasteriser.cullMode    = VK_CULL_MODE_BACK_BIT;   // dynamic: materials can be double-sided
     rasteriser.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasteriser.lineWidth   = 1.0f;
 
     // ---- Multisampling (off) ----
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisampling.rasterizationSamples = OffscreenBuffer::kSampleCount;   // the scene pass is multisampled
 
     // ---- Depth test ----
     // Depth range is [0, 1] (GLM_FORCE_DEPTH_ZERO_TO_ONE); nearer fragments
@@ -133,7 +137,7 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable  = VK_TRUE;
-    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = translucent ? VK_FALSE : VK_TRUE;   // translucent surfaces do not hide what is behind them
     depthStencil.depthCompareOp   = VK_COMPARE_OP_LESS;
 
     // ---- Colour blending (opaque) ----
@@ -141,6 +145,27 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     blendAttachment.colorWriteMask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (!translucent) {
+        // Cut-out edges are smoothed by alpha to coverage, which reads the
+        // alpha the shader writes. That alpha must not end up in the picture
+        // (the viewport would show the window through the edges), so only the
+        // colour is written: the alpha stays at the clear value, 1.
+        multisampling.alphaToCoverageEnable = VK_TRUE;
+        blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                                       | VK_COLOR_COMPONENT_B_BIT;
+    }
+    if (translucent) {
+        // The shader outputs colour already multiplied by alpha (so that the
+        // highlights, which glass keeps, can be left out of the product):
+        // result = source + destination * (1 - alpha).
+        blendAttachment.blendEnable         = VK_TRUE;
+        blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.colorBlendOp        = VK_BLEND_OP_ADD;
+        blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.alphaBlendOp        = VK_BLEND_OP_ADD;
+    }
 
     VkPipelineColorBlendStateCreateInfo blending{};
     blending.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -151,13 +176,14 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     VkDynamicState dynamicStates[] = {
         VK_DYNAMIC_STATE_VIEWPORT,
         VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_CULL_MODE,
     };
     VkPipelineDynamicStateCreateInfo dynamicState{};
     dynamicState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicState.dynamicStateCount = 2;
+    dynamicState.dynamicStateCount = 3;
     dynamicState.pDynamicStates    = dynamicStates;
 
-    // ---- Pipeline layout: set 0 (scene data), set 1 (material) + push constants ----
+    // ---- Pipeline layout: set 0 (scene data), set 1 (material), set 2 (environment), set 3 (occlusion) + push constants ----
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushRange.offset     = 0;
@@ -165,8 +191,8 @@ bool MeshPipeline::init(const VulkanContext& ctx,
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    const VkDescriptorSetLayout setLayouts[] = {sceneLayout, materialLayout};
-    layoutInfo.setLayoutCount         = 2;
+    const VkDescriptorSetLayout setLayouts[] = {sceneLayout, materialLayout, environmentLayout, occlusionLayout};
+    layoutInfo.setLayoutCount         = 4;
     layoutInfo.pSetLayouts            = setLayouts;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges    = &pushRange;
@@ -231,6 +257,7 @@ void MeshPipeline::bind(VkCommandBuffer cmd, VkExtent2D extent) const {
     VkRect2D scissor{};
     scissor.extent = extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdSetCullMode(cmd, VK_CULL_MODE_BACK_BIT);
 }
 
 void MeshPipeline::bindDescriptorSet(VkCommandBuffer cmd, VkDescriptorSet sceneSet) const {
@@ -244,6 +271,24 @@ void MeshPipeline::bindMaterial(VkCommandBuffer cmd, VkDescriptorSet materialSet
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
                             1,               // first set number: set 1
                             1, &materialSet,
+                            0, nullptr);
+}
+
+void MeshPipeline::setDoubleSided(VkCommandBuffer cmd, bool doubleSided) const {
+    vkCmdSetCullMode(cmd, doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+}
+
+void MeshPipeline::bindEnvironment(VkCommandBuffer cmd, VkDescriptorSet environmentSet) const {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
+                            2,               // first set number: set 2
+                            1, &environmentSet,
+                            0, nullptr);
+}
+
+void MeshPipeline::bindOcclusion(VkCommandBuffer cmd, VkDescriptorSet occlusionSet) const {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
+                            3,               // first set number: set 3
+                            1, &occlusionSet,
                             0, nullptr);
 }
 

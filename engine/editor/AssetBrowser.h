@@ -114,6 +114,17 @@ public:
     void setImageThumbnails(ImageThumbnails* thumbnails) { m_imageThumbnails = thumbnails; }
 
     /**
+     * @brief Returns the model the user double-clicked (or opened with Enter), once.
+     *
+     * Same hand-over as takeSceneToOpen(): the editor shows it in the model viewer.
+     */
+    std::filesystem::path takeModelToOpen() {
+        std::filesystem::path path = std::move(m_modelToOpen);
+        m_modelToOpen.clear();
+        return path;
+    }
+
+    /**
      * @brief Returns the image the user double-clicked (or opened with Enter), once.
      *
      * Same hand-over as takeSceneToOpen(): the caller decides what opening
@@ -269,6 +280,7 @@ private:
     ImageThumbnails*        m_imageThumbnails = nullptr; ///< Source of image pictures, or null.
     std::filesystem::path   m_sceneToOpen; ///< Scene double-clicked this frame, or empty.
     std::filesystem::path   m_imageToOpen; ///< Image double-clicked this frame, or empty.
+    std::filesystem::path   m_modelToOpen; ///< Model double-clicked this frame, or empty.
     std::filesystem::path   m_pendingDir;  ///< Folder to open once the grid is drawn, or empty.
     Nav                     m_pendingNav = Nav::None;
     std::vector<AssetEntry> m_entries;     ///< Everything in m_currentDir.

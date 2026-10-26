@@ -33,50 +33,78 @@ void ShadowPipeline::shutdown() {
 
     if (m_pipeline != VK_NULL_HANDLE)
         vkDestroyPipeline(m_ctx->device(), m_pipeline, nullptr);
+    if (m_maskedPipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(m_ctx->device(), m_maskedPipeline, nullptr);
     if (m_layout != VK_NULL_HANDLE)
         vkDestroyPipelineLayout(m_ctx->device(), m_layout, nullptr);
+    if (m_maskedLayout != VK_NULL_HANDLE)
+        vkDestroyPipelineLayout(m_ctx->device(), m_maskedLayout, nullptr);
 
-    m_pipeline = VK_NULL_HANDLE;
-    m_layout   = VK_NULL_HANDLE;
+    m_pipeline = m_maskedPipeline = VK_NULL_HANDLE;
+    m_layout = m_maskedLayout = VK_NULL_HANDLE;
     m_ctx      = nullptr;
 }
 
-bool ShadowPipeline::init(const VulkanContext& ctx, VkFormat depthFormat,
-                          const char* shaderDir) {
-    m_ctx = &ctx;
+bool ShadowPipeline::createPipeline(VkFormat depthFormat, const char* shaderDir,
+                                    const char* vertName, const char* fragName,
+                                    VkPipelineLayout layout, bool withUv, VkPipeline& out) {
+    const VulkanContext& ctx = *m_ctx;
 
-    // ---- Vertex shader (there is no fragment shader) ----
-    const auto code = readFile(std::string(shaderDir) + "/shadow.vert.spv");
-    if (code.empty()) { shutdown(); return false; }
-
-    VkShaderModuleCreateInfo moduleInfo{};
-    moduleInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    moduleInfo.codeSize = code.size();
-    moduleInfo.pCode    = reinterpret_cast<const uint32_t*>(code.data());
-
-    VkShaderModule vert = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(ctx.device(), &moduleInfo, nullptr, &vert) != VK_SUCCESS) {
-        FE_ERROR("ShadowPipeline: failed to create the shader module");
-        shutdown();
-        return false;
+    // ---- Shaders ----
+    const auto vertCode = readFile(std::string(shaderDir) + "/" + vertName);
+    if (vertCode.empty()) return false;
+    std::vector<char> fragCode;
+    if (fragName) {
+        fragCode = readFile(std::string(shaderDir) + "/" + fragName);
+        if (fragCode.empty()) return false;
     }
 
-    VkPipelineShaderStageCreateInfo stage{};
-    stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stage.stage  = VK_SHADER_STAGE_VERTEX_BIT;
-    stage.module = vert;
-    stage.pName  = "main";
+    const auto makeModule = [&](const std::vector<char>& code) {
+        VkShaderModuleCreateInfo moduleInfo{};
+        moduleInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        moduleInfo.codeSize = code.size();
+        moduleInfo.pCode    = reinterpret_cast<const uint32_t*>(code.data());
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(ctx.device(), &moduleInfo, nullptr, &module) != VK_SUCCESS)
+            FE_ERROR("ShadowPipeline: failed to create the shader module");
+        return module;
+    };
 
-    // ---- Vertex input: the same buffers as the main pass, but only the position is read ----
+    VkShaderModule vert = makeModule(vertCode);
+    VkShaderModule frag = fragName ? makeModule(fragCode) : VK_NULL_HANDLE;
+    const auto cleanup = [&] {
+        if (vert) vkDestroyShaderModule(ctx.device(), vert, nullptr);
+        if (frag) vkDestroyShaderModule(ctx.device(), frag, nullptr);
+    };
+    if (!vert || (fragName && !frag)) { cleanup(); return false; }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vert;
+    stages[0].pName  = "main";
+    uint32_t stageCount = 1;
+    if (frag) {
+        stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = frag;
+        stages[1].pName  = "main";
+        stageCount = 2;
+    }
+
+    // ---- Vertex input: the same buffers as the main pass, but only the position
+    //      (and the texture coordinates, for the cut-out variant) are read ----
     const auto binding = Vertex::bindingDescription();
-    const auto attrs   = Vertex::attributeDescriptions();   // [0] is the position
+    const auto attrs   = Vertex::attributeDescriptions();   // [0] position, [3] uv
+    VkVertexInputAttributeDescription used[2] = {attrs[0], attrs[3]};
+    used[1].location = 1;                                    // shadow_mask.vert's location
 
     VkPipelineVertexInputStateCreateInfo vertexInput{};
     vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInput.vertexBindingDescriptionCount   = 1;
     vertexInput.pVertexBindingDescriptions      = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 1;
-    vertexInput.pVertexAttributeDescriptions    = &attrs[0];
+    vertexInput.vertexAttributeDescriptionCount = withUv ? 2 : 1;
+    vertexInput.pVertexAttributeDescriptions    = used;
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -125,23 +153,6 @@ bool ShadowPipeline::init(const VulkanContext& ctx, VkFormat depthFormat,
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates    = dynamicStates;
 
-    // ---- Layout: one push constant block, no descriptor sets ----
-    VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pushRange.size       = sizeof(ShadowPushConstants);
-
-    VkPipelineLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.pushConstantRangeCount = 1;
-    layoutInfo.pPushConstantRanges    = &pushRange;
-
-    if (vkCreatePipelineLayout(ctx.device(), &layoutInfo, nullptr, &m_layout) != VK_SUCCESS) {
-        FE_ERROR("ShadowPipeline: failed to create the pipeline layout");
-        vkDestroyShaderModule(ctx.device(), vert, nullptr);
-        shutdown();
-        return false;
-    }
-
     // ---- Dynamic rendering: depth only ----
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
@@ -150,8 +161,8 @@ bool ShadowPipeline::init(const VulkanContext& ctx, VkFormat depthFormat,
     VkGraphicsPipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pipelineInfo.pNext               = &renderingInfo;
-    pipelineInfo.stageCount          = 1;
-    pipelineInfo.pStages             = &stage;
+    pipelineInfo.stageCount          = stageCount;
+    pipelineInfo.pStages             = stages;
     pipelineInfo.pVertexInputState   = &vertexInput;
     pipelineInfo.pInputAssemblyState = &inputAssembly;
     pipelineInfo.pViewportState      = &viewportState;
@@ -160,15 +171,50 @@ bool ShadowPipeline::init(const VulkanContext& ctx, VkFormat depthFormat,
     pipelineInfo.pDepthStencilState  = &depthStencil;
     pipelineInfo.pColorBlendState    = &blending;
     pipelineInfo.pDynamicState       = &dynamicState;
-    pipelineInfo.layout              = m_layout;
+    pipelineInfo.layout              = layout;
 
     const VkResult result = vkCreateGraphicsPipelines(
-        ctx.device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
-
-    vkDestroyShaderModule(ctx.device(), vert, nullptr);
+        ctx.device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &out);
+    cleanup();
 
     if (result != VK_SUCCESS) {
         FE_ERROR("ShadowPipeline: failed to create the graphics pipeline");
+        return false;
+    }
+    return true;
+}
+
+bool ShadowPipeline::init(const VulkanContext& ctx, VkFormat depthFormat,
+                          const char* shaderDir, VkDescriptorSetLayout materialLayout) {
+    m_ctx = &ctx;
+
+    // ---- Layouts: one push constant block; the cut-out variant adds the material set ----
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushRange.size       = sizeof(ShadowPushConstants);
+
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges    = &pushRange;
+    if (vkCreatePipelineLayout(ctx.device(), &layoutInfo, nullptr, &m_layout) != VK_SUCCESS) {
+        FE_ERROR("ShadowPipeline: failed to create the pipeline layout");
+        shutdown();
+        return false;
+    }
+
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts    = &materialLayout;
+    if (vkCreatePipelineLayout(ctx.device(), &layoutInfo, nullptr, &m_maskedLayout) != VK_SUCCESS) {
+        FE_ERROR("ShadowPipeline: failed to create the cut-out pipeline layout");
+        shutdown();
+        return false;
+    }
+
+    if (!createPipeline(depthFormat, shaderDir, "shadow.vert.spv", nullptr,
+                        m_layout, false, m_pipeline) ||
+        !createPipeline(depthFormat, shaderDir, "shadow_mask.vert.spv", "shadow_mask.frag.spv",
+                        m_maskedLayout, true, m_maskedPipeline)) {
         shutdown();
         return false;
     }
@@ -179,10 +225,18 @@ bool ShadowPipeline::init(const VulkanContext& ctx, VkFormat depthFormat,
 
 void ShadowPipeline::bind(VkCommandBuffer cmd) const {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+    m_maskedBound = false;
+}
+
+void ShadowPipeline::bindMasked(VkCommandBuffer cmd, VkDescriptorSet materialSet) const {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_maskedPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_maskedLayout,
+                            0, 1, &materialSet, 0, nullptr);
+    m_maskedBound = true;
 }
 
 void ShadowPipeline::push(VkCommandBuffer cmd, const ShadowPushConstants& pc) const {
-    vkCmdPushConstants(cmd, m_layout, VK_SHADER_STAGE_VERTEX_BIT,
+    vkCmdPushConstants(cmd, m_maskedBound ? m_maskedLayout : m_layout, VK_SHADER_STAGE_VERTEX_BIT,
                        0, sizeof(ShadowPushConstants), &pc);
 }
 

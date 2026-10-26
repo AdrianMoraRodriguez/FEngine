@@ -7,6 +7,7 @@
 #include "editor/EditorTheme.h"
 #include "editor/Icons.h"
 #include "gfx/ThumbnailRenderer.h"
+#include "import/AssetDatabase.h"
 #include "import/ModelImporter.h"
 
 #include <imgui.h>
@@ -47,10 +48,12 @@ bool isTexture(const std::string& ext) {
         || ext == ".hdr"  || ext == ".tga" || ext == ".dds" || ext == ".bmp";
 }
 
-/// Returns true if @p ext is an image ImageLoader can decode (.hdr and .dds
-/// are shown as images, but cannot be used as textures yet).
+/// Returns true if @p ext is an image ImageLoader can decode (.dds is shown as
+/// an image, but cannot be used as a texture yet). A .hdr works as the scene's
+/// environment; as an ordinary texture it is clamped to the displayable range.
 bool isLoadableImage(const std::string& ext) {
-    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".tga";
+    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".tga"
+        || ext == ".hdr";
 }
 
 /// Returns true if @p ext is a recognised scene file.
@@ -219,6 +222,9 @@ void moveOnDisk(const std::filesystem::path& source, const std::filesystem::path
         std::filesystem::copy(source, dest, std::filesystem::copy_options::recursive, ec);
         if (!ec) std::filesystem::remove_all(source, ec);
     }
+
+    // Scenes refer to assets by id: the id must follow the file.
+    if (!ec) AssetDatabase::instance().moved(source, dest);
 }
 
 /// @return The paths in a drag payload: UTF-8 text, one path per line.
@@ -268,6 +274,10 @@ void AssetBrowser::refresh() {
         // Skip hidden files (starting with '.') like .gitkeep.
         const std::string filename = toUtf8(it->path().filename());
         if (!filename.empty() && filename[0] == '.') continue;
+
+        // The ".meta" sidecars hold asset ids (see AssetDatabase). They travel
+        // with their file and are never shown or handled by hand.
+        if (AssetDatabase::isMetaFile(it->path())) continue;
 
         std::error_code entryEc;
 
@@ -856,6 +866,8 @@ void AssetBrowser::interact(const AssetEntry& entry, size_t visibleIndex) {
             m_sceneToOpen = entry.path;
         else if (isLoadableImage(lowerExtension(entry.path)))
             m_imageToOpen = entry.path;
+        else if (isSupportedModel(entry.path))
+            m_modelToOpen = entry.path;
     }
 
     // ---- Dragging ----
@@ -968,8 +980,11 @@ void AssetBrowser::drawEntryMenu(const AssetEntry& entry) {
     if (single && !entry.isDir && isLoadableImage(lowerExtension(entry.path)) &&
         ImGui::MenuItem(FE_ICON_EXTERNAL_LINK "  Open in Viewer"))
         m_imageToOpen = entry.path;
+    if (single && !entry.isDir && isSupportedModel(entry.path) &&
+        ImGui::MenuItem(FE_ICON_EXTERNAL_LINK "  Open in Viewer"))
+        m_modelToOpen = entry.path;
     if (single && (entry.isDir || isScene(lowerExtension(entry.path)) ||
-                   isLoadableImage(lowerExtension(entry.path))))
+                   isLoadableImage(lowerExtension(entry.path)) || isSupportedModel(entry.path)))
         ImGui::Separator();
 
     if (ImGui::MenuItem(FE_ICON_COPY "  Copy", "Ctrl+C"))
@@ -1058,6 +1073,7 @@ void AssetBrowser::handleShortcuts() {
         if (std::filesystem::is_directory(targets[0], ec))   m_pendingDir  = targets[0];
         else if (isScene(lowerExtension(targets[0])))        m_sceneToOpen = targets[0];
         else if (isLoadableImage(lowerExtension(targets[0]))) m_imageToOpen = targets[0];
+        else if (isSupportedModel(targets[0]))               m_modelToOpen = targets[0];
     }
 }
 
@@ -1142,7 +1158,10 @@ void AssetBrowser::paste(const std::filesystem::path& destDir) {
             const std::filesystem::path dest = uniquePath(destDir, source.filename(), isDir);
             std::filesystem::copy(source, dest, std::filesystem::copy_options::recursive, ec);
             if (ec) problems += "'" + name + "': " + ec.message() + "\n";
-            else    created.push_back(dest);
+            else {
+                created.push_back(dest);
+                AssetDatabase::instance().scan(dest);   // the copy is a new asset: new id
+            }
         }
     }
 
@@ -1256,7 +1275,10 @@ void AssetBrowser::applyDrop() {
         const std::filesystem::path dest = uniquePath(destDir, source.filename(), isDir);
         std::filesystem::copy(source, dest, std::filesystem::copy_options::recursive, ec);
         if (ec) problems += "'" + name + "': " + ec.message() + "\n";
-        else    created.push_back(dest);
+        else {
+            created.push_back(dest);
+            AssetDatabase::instance().scan(dest);   // new asset(s): new id(s)
+        }
     }
 
     if (!created.empty()) {
@@ -1326,6 +1348,7 @@ void AssetBrowser::drawDialogs() {
             } else if (dest != m_dialogTarget) {
                 std::filesystem::rename(m_dialogTarget, dest, ec);
                 if (!ec) {
+                    AssetDatabase::instance().moved(m_dialogTarget, dest);
                     for (auto& item : m_clipboard)
                         if (item == m_dialogTarget) item = dest;
                 }
@@ -1385,6 +1408,7 @@ void AssetBrowser::drawDialogs() {
             for (const auto& path : m_deleteTargets) {
                 std::filesystem::remove_all(path, ec);
                 if (ec) problems += "'" + toUtf8(path.filename()) + "': " + ec.message() + "\n";
+                else    AssetDatabase::instance().removed(path);
 
                 // Forget anything that pointed at what was deleted.
                 m_selection.erase(path);

@@ -119,6 +119,15 @@ struct SceneUniformData {
     /// xyz: the direction the camera looks along. w: such that
     /// dot(xyz, point) + w is the point's distance in front of the camera.
     glm::vec4 cameraForward{0.0f, 0.0f, -1.0f, 0.0f};
+
+    /// w = 1: xyz is the camera's position in the world. w = 0: the camera is
+    /// treated as infinitely far (the previews) and xyz is the unit vector
+    /// from the scene towards it. The specular highlights need it.
+    glm::vec4 cameraPosition{0.0f, 0.0f, 0.0f, 1.0f};
+
+    /// x: how bright the environment's light is (a multiplier; 0 turns it off).
+    /// yzw: unused.
+    glm::vec4 environmentParams{1.0f, 0.0f, 0.0f, 0.0f};
 };
 
 static_assert(sizeof(GpuLight) == 64,
@@ -137,7 +146,7 @@ static_assert(offsetof(SceneUniformData, cameraForward) ==
               48 + 80 * kMaxShadowCasters + 64 * kMaxLights + 80 * kShadowCascades + 16,
               "The camera data must follow the cascade data");
 static_assert(sizeof(SceneUniformData) ==
-              48 + 80 * kMaxShadowCasters + 64 * kMaxLights + 80 * kShadowCascades + 32,
+              48 + 80 * kMaxShadowCasters + 64 * kMaxLights + 80 * kShadowCascades + 64,
               "SceneUniformData must match the std140 block in mesh.frag");
 
 /**

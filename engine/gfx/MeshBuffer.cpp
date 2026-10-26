@@ -147,12 +147,20 @@ bool MeshBuffer::upload(const VulkanContext& ctx,
     return true;
 }
 
-void MeshBuffer::draw(VkCommandBuffer cmd) const {
+void MeshBuffer::bind(VkCommandBuffer cmd) const {
     VkBuffer     buffers[] = {m_vertexBuffer};
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
     vkCmdBindIndexBuffer(cmd, m_indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+}
+
+void MeshBuffer::drawRange(VkCommandBuffer cmd, uint32_t firstIndex, uint32_t indexCount) const {
+    vkCmdDrawIndexed(cmd, indexCount, 1, firstIndex, 0, 0);
+}
+
+void MeshBuffer::draw(VkCommandBuffer cmd) const {
+    bind(cmd);
+    drawRange(cmd, 0, m_indexCount);
 }
 
 } // namespace fe

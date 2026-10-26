@@ -25,7 +25,25 @@ void decomposeInto(Transform& t, const glm::mat4& m) {
     }
 }
 
+/// Called by the registry whenever a MeshRenderer is added to an entity: gives
+/// the entity a default MaterialComponent if it has none. It covers every way
+/// an object can appear (the Create menu, dropping a model, adding the
+/// component by hand, loading a scene saved before this rule existed). A
+/// material that is already there, or one loaded from the scene file right
+/// after, is kept: the loader replaces it.
+///
+/// A plain function, not a lambda that captures the Scene, so that it stays
+/// valid when the Scene is moved.
+void ensureMaterial(entt::registry& registry, entt::entity entity) {
+    if (!registry.all_of<MaterialComponent>(entity))
+        registry.emplace<MaterialComponent>(entity);
+}
+
 } // namespace
+
+Scene::Scene() {
+    m_registry.on_construct<MeshRenderer>().connect<&ensureMaterial>();
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers

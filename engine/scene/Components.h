@@ -13,6 +13,8 @@
  *   4. Calling ComponentRegistry::instance().add<T>() in registerBuiltinComponents().
  */
 
+#include "core/Log.h"
+#include "import/AssetDatabase.h"
 #include "scene/UUID.h"
 
 #include <entt/entt.hpp>
@@ -145,7 +147,7 @@ struct WorldTransform {
  * Both handles are zero (invalid) until the user assigns an asset.
  */
 struct MeshRenderer {
-    AssetHandle mesh     = 0;         ///< Handle to a Mesh asset.
+    AssetHandle mesh     = 0;         ///< Built-in mesh (fe::builtin) or the id of a model asset (see AssetDatabase).
     AssetHandle material = 0;         ///< Handle to a Material asset.
     bool        castShadows = true;   ///< Whether this mesh casts shadows.
 };
@@ -153,20 +155,58 @@ struct MeshRenderer {
 /**
  * @brief How the surface of an entity's mesh looks.
  *
- * Optional: a mesh without it is drawn with its own vertex colours only.
- * The final colour of a pixel is
- * `vertex colour * baseColor * texture colour`, so the defaults (white tint,
- * no texture) change nothing.
+ * Every entity with a MeshRenderer has one (the scene adds it), and its
+ * defaults change nothing: the mesh is drawn as its own materials say. What
+ * it holds takes the place of what the model says, never the other way round.
+ *
+ * ### Colour
+ * The final colour of a pixel is `vertex colour * baseColor * albedo texture`.
+ *
+ * ### Textures
+ * Each slot is the id of an image asset (see AssetDatabase), or 0 to keep the
+ * model's own texture for that slot (none, for the built-in shapes). An id,
+ * not a path, so moving or renaming the image does not break the material.
+ *
+ * ### Surface values
+ * Metalness, roughness, normal strength and emissive light come from the
+ * model's materials (a built-in shape has plain defaults). With
+ * @c customSurface on, the numbers below replace them on every part of the
+ * object. The textures multiply whichever numbers apply, as in glTF.
  */
 struct MaterialComponent {
     /// Tint, as sRGB colour (what the colour picker shows). Multiplies the
     /// vertex colour and the texture.
     glm::vec3 baseColor{1.0f};
 
-    /// Albedo (colour) texture, as a path relative to the asset folder with
-    /// '/' as separator, or empty for none. Stored as text so a scene file
-    /// means the same on every machine.
-    std::string albedoTexture;
+    AssetHandle albedoTexture     = 0;   ///< Colour (sRGB).
+    AssetHandle metalRoughTexture = 0;   ///< Roughness in green, metalness in blue (linear), as glTF.
+    AssetHandle normalTexture     = 0;   ///< Tangent-space normal map (linear).
+    AssetHandle emissiveTexture   = 0;   ///< Light the surface gives off (sRGB).
+
+    /// Whether the values below are used. When off, the model's own are.
+    bool customSurface = false;
+
+    float     metallic       = 0.0f;   ///< 0 plastic, wood, stone... 1 bare metal.
+    float     roughness      = 0.5f;   ///< 0 mirror, 1 completely matte.
+    float     normalStrength = 1.0f;   ///< Scales how much the normal map bends the surface; 0 turns it off.
+    glm::vec3 emissiveColor{0.0f};     ///< sRGB colour of the light the surface gives off.
+    float     emissiveIntensity = 1.0f;///< Multiplies emissiveColor.
+
+    /// How the transparency of the object is decided.
+    enum class Transparency : int {
+        Model  = 0,   ///< The model's own setting (solid, for the built-in shapes).
+        Opaque = 1,   ///< Solid: the albedo's alpha is ignored.
+        Cutout = 2,   ///< Pixels with alpha below @c alphaCutoff are not drawn; the rest are solid.
+        Blend  = 3,   ///< Translucent: mixed with what is behind, by alpha and @c opacity.
+    };
+
+    Transparency transparency = Transparency::Model;
+    float alphaCutoff = 0.5f;   ///< Cutout only: alpha below this is dropped.
+    float opacity     = 1.0f;   ///< Multiplies the albedo's alpha (0 invisible, 1 as the texture says). Only has an effect on translucent surfaces.
+
+    /// Draw the back faces as well (leaves, cloth, glass seen from inside).
+    /// The model's own double-sided setting applies even when this is off.
+    bool  doubleSided = false;
 };
 
 /**
@@ -235,8 +275,76 @@ struct LightComponent {
 // Component serialisation — generates to_json/from_json for each struct.
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NameComponent, name)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Transform, position, rotation, scale)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MeshRenderer, mesh, material, castShadows)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(MaterialComponent, baseColor, albedoTexture)
+
+// MeshRenderer and MaterialComponent are written by hand: scenes saved before
+// assets had stable ids hold a hash of the model's path and the texture's path
+// as text, and loading must turn those into ids (see AssetDatabase).
+inline void to_json(json& j, const MeshRenderer& m) {
+    j = json{{"mesh", m.mesh}, {"material", m.material}, {"castShadows", m.castShadows}};
+}
+inline void from_json(const json& j, MeshRenderer& m) {
+    m.mesh = AssetDatabase::instance().upgradeMeshHandle(j.at("mesh").get<AssetHandle>());
+    j.at("material").get_to(m.material);
+    j.at("castShadows").get_to(m.castShadows);
+}
+
+inline void to_json(json& j, const MaterialComponent& m) {
+    j = json{{"baseColor", m.baseColor},
+             {"albedoTexture", m.albedoTexture},
+             {"metalRoughTexture", m.metalRoughTexture},
+             {"normalTexture", m.normalTexture},
+             {"emissiveTexture", m.emissiveTexture},
+             {"customSurface", m.customSurface},
+             {"metallic", m.metallic},
+             {"roughness", m.roughness},
+             {"normalStrength", m.normalStrength},
+             {"emissiveColor", m.emissiveColor},
+             {"emissiveIntensity", m.emissiveIntensity},
+             {"transparency", static_cast<int>(m.transparency)},
+             {"alphaCutoff", m.alphaCutoff},
+             {"opacity", m.opacity},
+             {"doubleSided", m.doubleSided}};
+}
+
+/// Reads a texture id stored under @p key: a number, or (scenes saved before
+/// assets had ids) a path relative to the asset folder. 0 if absent.
+inline AssetHandle readTextureId(const json& j, const char* key) {
+    const auto texture = j.find(key);
+    if (texture == j.end()) return 0;
+
+    if (texture->is_string()) {
+        const std::string path = texture->get<std::string>();
+        if (path.empty()) return 0;
+        const AssetHandle id = AssetDatabase::instance().idFromLegacyPath(path);
+        if (id == 0) FE_WARN("Material: texture '%s' was not found", path.c_str());
+        return id;
+    }
+    if (texture->is_number_unsigned()) return texture->get<AssetHandle>();
+    return 0;
+}
+
+inline void from_json(const json& j, MaterialComponent& m) {
+    // Every key is optional: scenes saved before a field existed still load.
+    const MaterialComponent defaults;
+    m.baseColor         = j.value("baseColor", defaults.baseColor);
+    m.albedoTexture     = readTextureId(j, "albedoTexture");
+    m.metalRoughTexture = readTextureId(j, "metalRoughTexture");
+    m.normalTexture     = readTextureId(j, "normalTexture");
+    m.emissiveTexture   = readTextureId(j, "emissiveTexture");
+    m.customSurface     = j.value("customSurface", defaults.customSurface);
+    m.metallic          = j.value("metallic", defaults.metallic);
+    m.roughness         = j.value("roughness", defaults.roughness);
+    m.normalStrength    = j.value("normalStrength", defaults.normalStrength);
+    m.emissiveColor     = j.value("emissiveColor", defaults.emissiveColor);
+    m.emissiveIntensity = j.value("emissiveIntensity", defaults.emissiveIntensity);
+    const int transparency = j.value("transparency", static_cast<int>(defaults.transparency));
+    m.transparency = (transparency >= 0 && transparency <= 3)
+                   ? static_cast<MaterialComponent::Transparency>(transparency)
+                   : defaults.transparency;
+    m.alphaCutoff       = j.value("alphaCutoff", defaults.alphaCutoff);
+    m.opacity           = j.value("opacity", defaults.opacity);
+    m.doubleSided       = j.value("doubleSided", defaults.doubleSided);
+}
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(CameraComponent, fovDegrees, nearPlane, farPlane, primary)
 
 // The WITH_DEFAULT variant fills in any key the file does not have. Scenes

@@ -111,6 +111,12 @@ private:
                           float x, float y, float width, float height);
 
     /// Points the editor camera at the selected entity.
+    /// Puts the image @p file, dropped on the viewport, as the albedo of the
+    /// object under the cursor. Does nothing (and says why) if the cursor is
+    /// not over an object or the image is not inside the asset folder.
+    void applyTextureDrop(const std::filesystem::path& file,
+                          float x, float y, float width, float height);
+
     void focusSelected();
 
     OffscreenBuffer& m_offscreen;

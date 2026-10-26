@@ -30,7 +30,8 @@ namespace fe {
 bool isSupportedModel(const std::filesystem::path& file);
 
 /**
- * @brief Imports a model file as a single merged mesh.
+ * @brief Imports a model file as a single merged mesh, with one index range
+ *        (MeshData::parts) per material and its albedo texture, if it has one.
  *
  * @param file    Path to a file for which isSupportedModel() is `true`.
  * @param control Optional progress report and cancellation. Only the Assimp

@@ -2,6 +2,7 @@
 
 #include "core/Log.h"
 #include "core/PathUtil.h"
+#include "import/AssetDatabase.h"
 #include "editor/EditorTheme.h"
 #include "editor/Icons.h"
 
@@ -184,6 +185,12 @@ void ViewportPanel::onImGui() {
             const std::filesystem::path file(std::u8string(
                 reinterpret_cast<const char8_t*>(payload->Data)));
             instantiateModel(file, imageMin.x, imageMin.y, imageSize.x, imageSize.y);
+        }
+        // An image dropped on an object becomes its albedo texture.
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FE_IMAGE")) {
+            const std::filesystem::path file(std::u8string(
+                reinterpret_cast<const char8_t*>(payload->Data)));
+            applyTextureDrop(file, imageMin.x, imageMin.y, imageSize.x, imageSize.y);
         }
         ImGui::EndDragDropTarget();
     }
@@ -716,6 +723,25 @@ entt::entity ViewportPanel::pickEntity(const Ray& ray) const {
     }
 
     return best;
+}
+
+void ViewportPanel::applyTextureDrop(const std::filesystem::path& file,
+                                     float x, float y, float width, float height) {
+    const AssetHandle texture = AssetDatabase::instance().idFor(file);
+    if (texture == 0) {
+        FE_WARN("Texture drop: '%s' is not an image inside the asset folder", toUtf8(file).c_str());
+        return;
+    }
+
+    const entt::entity target = pickEntity(cursorRay(x, y, width, height));
+    if (target == entt::null) return;   // dropped on empty space
+
+    // Every entity with a mesh has a MaterialComponent (the scene adds it);
+    // a camera, which can also be picked, has none.
+    auto* material = m_scene.registry().try_get<MaterialComponent>(target);
+    if (!material) return;
+
+    material->albedoTexture = texture;
 }
 
 void ViewportPanel::instantiateModel(const std::filesystem::path& file,

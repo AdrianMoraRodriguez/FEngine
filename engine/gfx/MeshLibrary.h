@@ -9,10 +9,10 @@
  *
  * Two kinds of handle exist:
  *   - Built-in primitives use the small fixed values of fe::builtin.
- *   - Imported models use the hash of their path relative to the asset
- *     root, with the top bit set so it can never collide with a built-in
- *     handle. The same file always gets the same handle, which is what lets
- *     saved scenes find their models again.
+ *   - Imported models use their asset id (see AssetDatabase), which has
+ *     the top bit set so it can never collide with a built-in handle. The
+ *     id is stored next to the file, so it survives moving and renaming the
+ *     model, which is what lets saved scenes find their models again.
  *
  * Imported models are read on a background thread, so a large file never
  * freezes the editor. Only the final upload to the GPU happens on the
@@ -22,6 +22,7 @@
 
 #include "core/Geometry.h"
 #include "gfx/MeshBuffer.h"
+#include "import/AssetDatabase.h"
 #include "import/ImportControl.h"
 #include "import/MeshData.h"
 #include "scene/Components.h"
@@ -57,6 +58,13 @@ struct ImportStatus {
     std::uintmax_t bytes   = 0;      ///< Size of the file on disk, 0 if unknown.
 };
 
+/// How an imported model is drawn: one range of indices per material.
+struct ModelParts {
+    std::vector<MeshPart>      parts;      ///< Never empty for an imported model.
+    std::vector<ModelMaterial> materials;  ///< What MeshPart::material refers to.
+    std::vector<ImageSource>   images;     ///< What the materials' texture indices refer to.
+};
+
 class MeshLibrary {
 public:
     /**
@@ -77,27 +85,15 @@ public:
     ///         std::quick_exit() instead of returning from main().
     bool importsStillRunning() const { return m_importsStillRunning; }
 
-    /// Sets the directory that model paths are relative to (normally `assets/`).
-    void setAssetRoot(std::filesystem::path root);
-
     /**
-     * @brief Registers every supported model file (see isSupportedModel())
-     *        under the asset root.
+     * @brief Returns the handle (asset id) of a model file.
      *
-     * Needed at startup so that a scene that references a model by handle
-     * can find the file again. Registering only records where the file is:
-     * nothing is read until the model is first used.
-     */
-    void scanAssets();
-
-    /**
-     * @brief Registers one model file and returns its handle.
-     *
-     * Safe to call repeatedly with the same file.
+     * The AssetDatabase knows where the model is, so nothing is read until it
+     * is first used. Safe to call repeatedly with the same file.
      *
      * @param file Path to a supported model file inside the asset root.
      * @return The handle, or fe::builtin::MeshNone if the file is outside
-     *         the asset root.
+     *         the asset root or not a model.
      */
     AssetHandle registerModel(const std::filesystem::path& file);
 
@@ -177,6 +173,13 @@ public:
     const MeshBuffer* get(AssetHandle handle) const;
 
     /**
+     * @brief Returns the material ranges of an imported model.
+     * @return The parts, or `nullptr` for built-in meshes and for models that
+     *         are not on the GPU (draw those whole).
+     */
+    const ModelParts* parts(AssetHandle handle) const;
+
+    /**
      * @brief Returns the local-space bounding box of a mesh.
      *
      * Computed from the vertex data when the mesh is uploaded, and padded
@@ -192,6 +195,7 @@ private:
     struct ImportedMesh {
         MeshBuffer buffer;
         Aabb       bounds;
+        ModelParts parts;
     };
 
     /// A model being read on a background thread.
@@ -215,11 +219,6 @@ private:
     MeshBuffer m_plane;
     Aabb       m_cubeBounds;
     Aabb       m_planeBounds;
-
-    std::filesystem::path m_assetRoot;
-
-    /// Where each registered model lives, relative to the asset root.
-    std::unordered_map<AssetHandle, std::filesystem::path> m_sources;
 
     /// Models already on the GPU.
     std::unordered_map<AssetHandle, ImportedMesh> m_imported;

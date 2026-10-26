@@ -10,8 +10,10 @@
  *   - push constants, rewritten for every draw call (the matrices), and
  *   - descriptor set 0, bound once per frame (the scene's lights; see
  *     SceneUniforms), and
- *   - descriptor set 1, bound per object (its material's texture; see
- *     TextureLibrary).
+ *   - descriptor set 1, bound per object (its material's textures; see
+ *     TextureLibrary), and
+ *   - descriptor set 2, the environment (the sky's light; see Environment), and
+ *   - descriptor set 3, the ambient occlusion (see AmbientOcclusion).
  *
  * Uses dynamic rendering: no VkRenderPass is needed.
  */
@@ -64,6 +66,13 @@ public:
      * @param shaderDir   Directory containing mesh.vert.spv / mesh.frag.spv.
      * @param sceneLayout Layout of descriptor set 0, which the shaders read
      *                    the scene data from (SceneUniforms::layout()).
+     * @param materialLayout    Layout of set 1 (TextureLibrary::layout()).
+     * @param environmentLayout Layout of set 2 (Environment::createLayout()).
+     * @param occlusionLayout   Layout of set 3 (AmbientOcclusion::resultLayout()).
+     * @param translucent       `true` builds the variant for translucent materials:
+     *                          its output is mixed with what is behind it and it
+     *                          does not write depth, so it must be drawn after
+     *                          the opaque objects, farthest first.
      * @return `true` on success.
      */
     bool init(const VulkanContext& ctx,
@@ -71,7 +80,10 @@ public:
               VkFormat depthFormat,
               const char* shaderDir,
               VkDescriptorSetLayout sceneLayout,
-              VkDescriptorSetLayout materialLayout);
+              VkDescriptorSetLayout materialLayout,
+              VkDescriptorSetLayout environmentLayout,
+              VkDescriptorSetLayout occlusionLayout,
+              bool translucent = false);
 
     /// Destroys all Vulkan objects.
     void shutdown();
@@ -80,12 +92,16 @@ public:
      * @brief Binds the pipeline and sets the dynamic viewport and scissor.
      *
      * Call once per pass, then bindDescriptorSet(), then call push() + a
-     * draw for each object.
+     * draw for each object. Faces turned away from the camera are culled
+     * until setDoubleSided(true) says otherwise.
      *
      * @param cmd    Command buffer to record into.
      * @param extent Size of the render area.
      */
     void bind(VkCommandBuffer cmd, VkExtent2D extent) const;
+
+    /// Chooses whether the next draw calls also draw the back faces.
+    void setDoubleSided(VkCommandBuffer cmd, bool doubleSided) const;
 
     /**
      * @brief Binds the descriptor set that holds the scene data (set 0).
@@ -102,6 +118,20 @@ public:
      * object uses a different texture.
      */
     void bindMaterial(VkCommandBuffer cmd, VkDescriptorSet materialSet) const;
+
+    /**
+     * @brief Binds the descriptor set with the environment (set 2).
+     *
+     * Call once per pass, before the first draw call.
+     */
+    void bindEnvironment(VkCommandBuffer cmd, VkDescriptorSet environmentSet) const;
+
+    /**
+     * @brief Binds the descriptor set with the ambient occlusion (set 3).
+     *
+     * Call once per pass, before the first draw call.
+     */
+    void bindOcclusion(VkCommandBuffer cmd, VkDescriptorSet occlusionSet) const;
 
     /**
      * @brief Uploads the per-object push constants.

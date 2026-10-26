@@ -81,6 +81,21 @@ public:
      */
     static bool loadFromFile(Scene& scene,
                              const std::filesystem::path& path);
+
+    /**
+     * @brief Populates a scene from JSON text, as produced by serialize().
+     *
+     * Same rules as loadFromFile(): call it on a freshly constructed Scene,
+     * and discard the scene if it returns `false`. Used by the undo history,
+     * which keeps its states as text.
+     *
+     * @param scene The scene to populate.
+     * @param text  The JSON document.
+     * @param label Name shown in log messages (a file name, for instance).
+     * @return `true` on success. Logs the reason on failure.
+     */
+    static bool loadFromString(Scene& scene, const std::string& text,
+                               const std::string& label);
 };
 
 } // namespace fe

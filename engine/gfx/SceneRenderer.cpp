@@ -1,6 +1,9 @@
 #include "gfx/SceneRenderer.h"
 
 #include "gfx/OffscreenBuffer.h"
+#include "gfx/VulkanContext.h"
+#include "import/AssetDatabase.h"
+#include "import/ImageLoader.h"
 #include "gfx/Renderer.h"
 #include "core/Log.h"
 
@@ -9,6 +12,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -114,8 +118,20 @@ glm::mat4 cascadeViewProjection(const glm::vec3& direction,
 } // namespace
 
 bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
+    m_ctx = &ctx;
     if (!m_meshes.init(ctx)) return false;
     if (!m_textures.init(ctx)) return false;   // before the pipeline: its layout is set 1
+
+    // The environments come before the pipelines too: their layout is set 2.
+    // The built-in sky is available at once, as a rough 32-texel bake that takes
+    // a few milliseconds; the full-quality one is baked in the background and
+    // replaces it when ready (updateEnvironment()).
+    m_environmentLayout = Environment::createLayout(ctx.device());
+    if (!m_environmentLayout) return false;
+    if (!m_defaultEnvironment.init(ctx, m_environmentLayout)) return false;
+    if (!m_sceneEnvironment.init(ctx, m_environmentLayout)) return false;
+    if (!m_defaultEnvironment.upload(bakeEnvironment(makeProceduralSky(), 32))) return false;
+    m_defaultBake = std::async(std::launch::async, [] { return bakeEnvironment(makeProceduralSky()); });
 
     // The shadow map comes before the uniforms (their descriptor sets point
     // at it), and the uniforms before the pipeline (its layout is built from
@@ -142,14 +158,31 @@ bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
 
     if (!m_uniforms.init(ctx, shadows)) return false;
 
-    if (!m_shadowPipeline.init(ctx, ShadowMap::kFormat, shaderDir)) return false;
+    if (!m_shadowPipeline.init(ctx, ShadowMap::kFormat, shaderDir, m_textures.layout())) return false;
+
+    if (!m_occlusion.init(ctx, shaderDir)) return false;   // before the pipeline: its layout is set 3
 
     if (!m_pipeline.init(ctx,
                          OffscreenBuffer::format(),
                          OffscreenBuffer::depthFormat(),
                          shaderDir,
                          m_uniforms.layout(),
-                         m_textures.layout())) return false;
+                         m_textures.layout(),
+                         m_environmentLayout,
+                         m_occlusion.resultLayout())) return false;
+
+    if (!m_translucentPipeline.init(ctx,
+                                    OffscreenBuffer::format(),
+                                    OffscreenBuffer::depthFormat(),
+                                    shaderDir,
+                                    m_uniforms.layout(),
+                                    m_textures.layout(),
+                                    m_environmentLayout,
+                                    m_occlusion.resultLayout(),
+                                    true)) return false;
+
+    if (!m_sky.init(ctx, OffscreenBuffer::format(), OffscreenBuffer::depthFormat(),
+                    shaderDir, m_environmentLayout)) return false;
 
     if (!m_outline.init(ctx, OffscreenBuffer::format(), OffscreenBuffer::depthFormat(), shaderDir))
         return false;
@@ -159,7 +192,20 @@ bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
 }
 
 void SceneRenderer::shutdown() {
+    // The bakes run on their own threads: wait for them before anything goes.
+    if (m_defaultBake.valid()) m_defaultBake.wait();
+    if (m_sceneBake.valid())   m_sceneBake.wait();
+
+    m_sky.shutdown();
+    m_occlusion.shutdown();
+    m_defaultEnvironment.shutdown();
+    m_sceneEnvironment.shutdown();
+    if (m_environmentLayout) {
+        vkDestroyDescriptorSetLayout(m_ctx->device(), m_environmentLayout, nullptr);
+        m_environmentLayout = VK_NULL_HANDLE;
+    }
     m_outline.shutdown();
+    m_translucentPipeline.shutdown();
     m_pipeline.shutdown();
     m_shadowPipeline.shutdown();
     m_uniforms.shutdown();
@@ -170,9 +216,69 @@ void SceneRenderer::shutdown() {
     m_meshes.shutdown();
 }
 
+void SceneRenderer::updateEnvironment(const Scene& scene) {
+    using namespace std::chrono_literals;
+    const auto finished = [](std::future<EnvironmentBake>& f) {
+        return f.valid() && f.wait_for(0s) == std::future_status::ready;
+    };
+
+    // The built-in sky, at full quality.
+    if (finished(m_defaultBake)) {
+        const EnvironmentBake bake = m_defaultBake.get();
+        if (bake.valid()) m_defaultEnvironment.upload(bake);
+    }
+
+    const AssetHandle wanted = scene.settings().environment;
+    if (wanted != m_failedEnvironment) m_failedEnvironment = 0;   // chosen something else: a retry is fine later
+
+    // A finished bake of the scene's picture. If the user has chosen another
+    // one meanwhile, it is dropped.
+    if (finished(m_sceneBake)) {
+        const EnvironmentBake bake = m_sceneBake.get();
+        const AssetHandle id = m_sceneBakeId;
+        m_sceneBakeId = 0;
+        if (id == wanted) {
+            if (bake.valid() && m_sceneEnvironment.upload(bake)) {
+                m_loadedEnvironment = id;
+            } else {
+                FE_WARN("SceneRenderer: environment '%s' could not be used; showing the default sky",
+                        AssetDatabase::instance().pathOf(id).c_str());
+                m_failedEnvironment = id;
+                m_loadedEnvironment = 0;
+            }
+        }
+    }
+
+    // Start loading what the scene asks for. One bake at a time. With no
+    // picture chosen the default sky is used; the last picture stays in memory,
+    // so choosing it again is instant.
+    if (wanted != 0 && wanted != m_loadedEnvironment && wanted != m_failedEnvironment &&
+        !m_sceneBake.valid()) {
+        const std::filesystem::path file = AssetDatabase::instance().fullPathOf(wanted);
+        if (file.empty()) {
+            FE_WARN("SceneRenderer: the scene's environment image is missing; showing the default sky");
+            m_failedEnvironment = wanted;
+        } else {
+            m_sceneBakeId = wanted;
+            m_sceneBake = std::async(std::launch::async, [file] {
+                const std::optional<HdrImageData> image = loadImageHdr(file);
+                return image ? bakeEnvironment(*image) : EnvironmentBake{};
+            });
+        }
+    }
+}
+
+VkDescriptorSet SceneRenderer::activeEnvironment(const Scene& scene) const {
+    // While another picture is loading, the previous one stays up.
+    if (scene.settings().environment != 0 && m_loadedEnvironment != 0 && m_sceneEnvironment.valid())
+        return m_sceneEnvironment.set();
+    return m_defaultEnvironment.set();
+}
+
 void SceneRenderer::prepare(const Scene& scene) {
     m_meshes.beginFrame();
     m_textures.update();
+    updateEnvironment(scene);
 
     auto view = scene.registry().view<const MeshRenderer>();
     for (auto [entity, renderer] : view.each())
@@ -185,7 +291,7 @@ void SceneRenderer::setupPreviewLighting() {
     // uploaded once: the light never changes, so the slot is never rewritten
     // while the GPU might still be reading it.
     Scene scene;
-    scene.settings().ambientIntensity = 0.35f;
+    scene.settings().ambientIntensity = 0.05f;   // the built-in sky does most of the filling-in
 
     const entt::entity key = scene.create("Preview Light");
 
@@ -202,14 +308,18 @@ void SceneRenderer::setupPreviewLighting() {
     scene.transform(key).rotation = glm::quatLookAt(-towardsLight, glm::vec3(0.0f, 1.0f, 0.0f));
     scene.updateTransforms();
 
-    m_uniforms.update(SceneUniforms::kPreviewSlot, gatherLights(scene));
+    // The preview camera always looks from the same direction (renderPreview()
+    // and the model viewer), so the shader gets that direction: w = 0 tells it
+    // that xyz is a direction towards the camera and not a position.
+    SceneUniformData data = gatherLights(scene);
+    data.cameraPosition = glm::vec4(glm::normalize(glm::vec3(0.75f, 0.55f, 1.0f)), 0.0f);
+    m_uniforms.update(SceneUniforms::kPreviewSlot, data);
 }
 
 bool SceneRenderer::renderPreview(VkCommandBuffer cmd, AssetHandle handle,
-                                  const OffscreenBuffer& target) {
-    const MeshBuffer*         mesh = m_meshes.get(handle);
-    const std::optional<Aabb> box  = m_meshes.bounds(handle);
-    if (!mesh || !box) return false;
+                                  const OffscreenBuffer& target, bool* settled) {
+    const std::optional<Aabb> box = m_meshes.bounds(handle);
+    if (!box) return false;
 
     // The camera looks at the middle of the mesh's bounding sphere, from far
     // enough that the whole sphere fits the vertical field of view.
@@ -224,15 +334,235 @@ bool SceneRenderer::renderPreview(VkCommandBuffer cmd, AssetHandle handle,
     glm::mat4 proj = glm::perspective(fovY, 1.0f, distance - 1.5f * radius, distance + 1.5f * radius);
     proj[1][1] *= -1.0f;   // Vulkan clip space: +Y points down (as in EditorCamera).
 
+    const uint64_t waitingBefore = m_textures.waitingRequests();
+    m_previewTextures = true;
+    const bool drawn = renderMeshView(cmd, handle, target, proj * view, glm::mat4(1.0f), true);
+    m_previewTextures = false;
+
+    if (settled) *settled = (m_textures.waitingRequests() == waitingBefore);
+    return drawn;
+}
+
+void SceneRenderer::MaterialOverride::applyTo(TextureLibrary::MaterialRequest& request) const {
+    for (int slot = 0; slot < TextureLibrary::SlotCount; ++slot)
+        if (textures[slot] != 0)
+            request.textures[slot] = {textures[slot], nullptr};
+
+    if (custom) {
+        request.metallic    = metallic;
+        request.roughness   = roughness;
+        request.normalScale = normalScale;
+        request.emissive    = emissive;
+    }
+
+    // Transparency. The model's own mode stays unless the entity chose one.
+    request.alphaMode = alphaModeOf(request.alphaMode);
+    if (transparency == MaterialComponent::Transparency::Cutout) request.alphaCutoff = alphaCutoff;
+    if (transparency != MaterialComponent::Transparency::Opaque) request.opacity *= opacity;
+    if (doubleSided) request.doubleSided = true;
+
+    // An emissive image the user chose must show: with no light colour to
+    // multiply it (a model that has none, or a black one), use white.
+    if (textures[TextureLibrary::Emissive] != 0 && request.emissive == glm::vec3(0.0f))
+        request.emissive = glm::vec3(1.0f);
+}
+
+AlphaMode SceneRenderer::MaterialOverride::alphaModeOf(AlphaMode fromModel) const {
+    switch (transparency) {
+        case MaterialComponent::Transparency::Opaque: return AlphaMode::Opaque;
+        case MaterialComponent::Transparency::Cutout: return AlphaMode::Mask;
+        case MaterialComponent::Transparency::Blend:  return AlphaMode::Blend;
+        default:                                      return fromModel;
+    }
+}
+
+SceneRenderer::MaterialOverride SceneRenderer::MaterialOverride::from(const MaterialComponent& c) {
+    MaterialOverride o;
+    o.textures[TextureLibrary::Albedo]     = c.albedoTexture;
+    o.textures[TextureLibrary::MetalRough] = c.metalRoughTexture;
+    o.textures[TextureLibrary::Normal]     = c.normalTexture;
+    o.textures[TextureLibrary::Emissive]   = c.emissiveTexture;
+
+    o.custom      = c.customSurface;
+    o.metallic    = std::clamp(c.metallic, 0.0f, 1.0f);
+    o.roughness   = std::clamp(c.roughness, 0.0f, 1.0f);
+    o.normalScale = std::max(c.normalStrength, 0.0f);
+    // The picker shows sRGB; the shader works in linear light.
+    o.emissive    = glm::pow(glm::max(c.emissiveColor, glm::vec3(0.0f)), glm::vec3(2.2f))
+                  * std::max(c.emissiveIntensity, 0.0f);
+
+    o.transparency = c.transparency;
+    o.alphaCutoff  = std::clamp(c.alphaCutoff, 0.0f, 1.0f);
+    o.opacity      = std::clamp(c.opacity, 0.0f, 1.0f);
+    o.doubleSided  = c.doubleSided;
+    return o;
+}
+
+TextureLibrary::MaterialRequest SceneRenderer::resolvePart(AssetHandle handle, const ModelParts* parts,
+                                                          const MeshPart* part,
+                                                          const MaterialOverride& material) const {
+    TextureLibrary::MaterialRequest request;
+
+    if (parts && part && part->material >= 0) {
+        const ModelMaterial& source = parts->materials[part->material];
+
+        // The slots, in the order of TextureLibrary::Slot.
+        const int images[TextureLibrary::SlotCount] = {
+            source.albedo, source.metalRough, source.normal, source.emissive};
+        for (int slot = 0; slot < TextureLibrary::SlotCount; ++slot) {
+            if (images[slot] < 0) continue;
+            request.textures[slot] = {
+                TextureLibrary::modelTextureKey(handle, static_cast<uint32_t>(images[slot])),
+                &parts->images[images[slot]]};
+        }
+        request.metallic    = source.metallic;
+        request.roughness   = source.roughness;
+        request.normalScale = source.normalScale;
+        request.emissive    = source.emissiveFactor;
+        request.alphaMode   = source.alphaMode;
+        request.alphaCutoff = source.alphaCutoff;
+        request.opacity     = source.opacity;
+        request.doubleSided = source.doubleSided;
+    }
+    material.applyTo(request);
+
+    // A thumbnail only needs the colour, and a small version of it: the other
+    // maps are invisible at 128 pixels, and a folder full of models must not
+    // load hundreds of full-size textures. Once the texture cache is half
+    // full, thumbnails stop adding to it and show the plain colours.
+    if (m_previewTextures) {
+        for (int slot = 0; slot < TextureLibrary::SlotCount; ++slot)
+            if (slot != TextureLibrary::Albedo) request.textures[slot] = {};
+        if (m_textures.textureCount() >= TextureLibrary::kMaxTextures / 2)
+            request.textures[TextureLibrary::Albedo] = {};
+        else
+            request.textures[TextureLibrary::Albedo].maxSize = 256;
+    }
+    return request;
+}
+
+bool SceneRenderer::hasTranslucentParts(AssetHandle handle, const MaterialOverride& material) const {
+    const ModelParts* parts = m_meshes.parts(handle);
+    if (!parts) return material.alphaModeOf(AlphaMode::Opaque) == AlphaMode::Blend;
+
+    for (const MeshPart& part : parts->parts) {
+        const AlphaMode fromModel = part.material >= 0 ? parts->materials[part.material].alphaMode
+                                                       : AlphaMode::Opaque;
+        if (material.alphaModeOf(fromModel) == AlphaMode::Blend) return true;
+    }
+    return false;
+}
+
+void SceneRenderer::drawMesh(VkCommandBuffer cmd, const MeshPipeline& pipeline, AssetHandle handle,
+                             const MeshBuffer& mesh, const MaterialOverride& material, bool textured,
+                             VkDescriptorSet& boundMaterial, DrawPass pass) {
+    const auto bindMaterial = [&](VkDescriptorSet set) {
+        if (set != boundMaterial) {   // neighbouring draws often share a material
+            pipeline.bindMaterial(cmd, set);
+            boundMaterial = set;
+        }
+    };
+    const bool wantTranslucent = (pass == DrawPass::Translucent);
+
+    // Built-in meshes have no material of their own: the default one, with
+    // whatever the entity's material puts in it. Without textures (the asset
+    // thumbnails) everything is drawn solid with the default material.
+    const ModelParts* parts = textured ? m_meshes.parts(handle) : nullptr;
+    if (!parts) {
+        if (!textured) {
+            if (wantTranslucent) return;
+            pipeline.setDoubleSided(cmd, false);
+            bindMaterial(m_textures.fallback());
+            mesh.draw(cmd);
+            return;
+        }
+        const TextureLibrary::MaterialRequest request = resolvePart(handle, nullptr, nullptr, material);
+        if ((request.alphaMode == AlphaMode::Blend) != wantTranslucent) return;
+        pipeline.setDoubleSided(cmd, request.doubleSided);
+        bindMaterial(m_textures.request(request));
+        mesh.draw(cmd);
+        return;
+    }
+
+    mesh.bind(cmd);
+    for (const MeshPart& part : parts->parts) {
+        const TextureLibrary::MaterialRequest request = resolvePart(handle, parts, &part, material);
+        if ((request.alphaMode == AlphaMode::Blend) != wantTranslucent) continue;
+
+        pipeline.setDoubleSided(cmd, request.doubleSided);
+        bindMaterial(m_textures.request(request));
+        mesh.drawRange(cmd, part.firstIndex, part.indexCount);
+    }
+}
+
+void SceneRenderer::drawDepthOnly(VkCommandBuffer cmd, AssetHandle handle, const MeshBuffer& mesh,
+                                  const MaterialOverride& material, const glm::mat4& mvp) {
+    const ModelParts* parts = m_meshes.parts(handle);
+
+    // One part: the solid pipeline, or the cut-out one with the material that
+    // holds the alpha. (The push constants go after the pipeline, which may
+    // have a different layout from the one before it.)
+    const auto drawPart = [&](const MeshPart* part, auto&& draw) {
+        const AlphaMode fromModel = (parts && part && part->material >= 0)
+                                  ? parts->materials[part->material].alphaMode : AlphaMode::Opaque;
+        const AlphaMode mode = material.alphaModeOf(fromModel);
+        if (mode == AlphaMode::Blend) return;   // translucent: no shadow, no occlusion
+
+        if (mode == AlphaMode::Mask)
+            m_shadowPipeline.bindMasked(cmd, m_textures.request(resolvePart(handle, parts, part, material)));
+        else
+            m_shadowPipeline.bind(cmd);
+        m_shadowPipeline.push(cmd, ShadowPushConstants{mvp});
+        draw();
+    };
+
+    if (!parts) {
+        drawPart(nullptr, [&] { mesh.draw(cmd); });
+        return;
+    }
+    mesh.bind(cmd);
+    for (const MeshPart& part : parts->parts)
+        drawPart(&part, [&] { mesh.drawRange(cmd, part.firstIndex, part.indexCount); });
+}
+
+SceneRenderer::MaterialOverride SceneRenderer::overrideOf(const Scene& scene, entt::entity entity) {
+    if (const auto* material = scene.registry().try_get<MaterialComponent>(entity))
+        return MaterialOverride::from(*material);
+    return MaterialOverride{};
+}
+
+bool SceneRenderer::renderMeshView(VkCommandBuffer cmd, AssetHandle handle,
+                                   const OffscreenBuffer& target, const glm::mat4& viewProj,
+                                   const glm::mat4& model, bool textured) {
+    const MeshBuffer* mesh = m_meshes.get(handle);
+    if (!mesh) return false;
+
     const VkExtent2D extent{target.width(), target.height()};
 
     Renderer::beginOffscreenPass(cmd, target);
 
     m_pipeline.bind(cmd, extent);
     m_pipeline.bindDescriptorSet(cmd, m_uniforms.set(SceneUniforms::kPreviewSlot));
-    m_pipeline.bindMaterial(cmd, m_textures.fallback());
-    m_pipeline.push(cmd, MeshPushConstants{proj * view, glm::mat4(1.0f)});
-    mesh->draw(cmd);
+    m_pipeline.bindEnvironment(cmd, m_defaultEnvironment.set());   // previews always use the built-in sky
+    m_pipeline.bindOcclusion(cmd, m_occlusion.whiteSet());          // and have no occlusion
+    VkDescriptorSet boundTexture = m_textures.fallback();
+    m_pipeline.bindMaterial(cmd, boundTexture);
+    m_pipeline.push(cmd, MeshPushConstants{viewProj * model, model});
+    drawMesh(cmd, m_pipeline, handle, *mesh, MaterialOverride{}, textured, boundTexture, DrawPass::Solid);
+
+    // A model with translucent parts: they go over the solid ones (in the
+    // order the model lists them; the viewer does not sort).
+    if (textured && hasTranslucentParts(handle, MaterialOverride{})) {
+        m_translucentPipeline.bind(cmd, extent);
+        m_translucentPipeline.bindDescriptorSet(cmd, m_uniforms.set(SceneUniforms::kPreviewSlot));
+        m_translucentPipeline.bindEnvironment(cmd, m_defaultEnvironment.set());
+        m_translucentPipeline.bindOcclusion(cmd, m_occlusion.whiteSet());
+        boundTexture = m_textures.fallback();
+        m_translucentPipeline.bindMaterial(cmd, boundTexture);
+        m_translucentPipeline.push(cmd, MeshPushConstants{viewProj * model, model});
+        drawMesh(cmd, m_translucentPipeline, handle, *mesh, MaterialOverride{}, textured, boundTexture,
+                 DrawPass::Translucent);
+    }
 
     Renderer::endOffscreenPass(cmd, target);
     return true;
@@ -244,6 +574,7 @@ SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
     // The scene's ambient light: the same on every surface, from every direction.
     const SceneSettings& settings = scene.settings();
     data.ambientColor = glm::vec4(settings.ambientColor * std::max(settings.ambientIntensity, 0.0f), 0.0f);
+    data.environmentParams = glm::vec4(std::max(settings.environmentIntensity, 0.0f), 0.0f, 0.0f, 0.0f);
 
     int count = 0;
     uint32_t nextShadowSlot = 0;       // flat maps: directional and spot lights
@@ -407,9 +738,7 @@ bool SceneRenderer::fitDirectionalShadow(const Scene& scene,
 }
 
 void SceneRenderer::drawShadowCasters(VkCommandBuffer cmd, const Scene& scene,
-                                      const glm::mat4& lightViewProj) const {
-    m_shadowPipeline.bind(cmd);
-
+                                      const glm::mat4& lightViewProj) {
     auto view = scene.registry().view<const MeshRenderer, const WorldTransform>();
     for (auto [entity, renderer, world] : view.each()) {
         if (!renderer.castShadows) continue;
@@ -417,8 +746,8 @@ void SceneRenderer::drawShadowCasters(VkCommandBuffer cmd, const Scene& scene,
         const MeshBuffer* mesh = m_meshes.get(renderer.mesh);
         if (!mesh) continue;
 
-        m_shadowPipeline.push(cmd, ShadowPushConstants{lightViewProj * world.matrix});
-        mesh->draw(cmd);
+        drawDepthOnly(cmd, renderer.mesh, *mesh, overrideOf(scene, entity),
+                      lightViewProj * world.matrix);
     }
 }
 
@@ -503,7 +832,8 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
     const glm::mat4 cameraWorld = glm::inverse(cameraView);
     const glm::vec3 cameraPos   = glm::vec3(cameraWorld[3]);
     const glm::vec3 forward     = -glm::normalize(glm::vec3(cameraWorld[2]));
-    data.cameraForward = glm::vec4(forward, -glm::dot(forward, cameraPos));
+    data.cameraForward  = glm::vec4(forward, -glm::dot(forward, cameraPos));
+    data.cameraPosition = glm::vec4(cameraPos, 1.0f);
 
     const float p22 = cameraProjection[2][2];
     const float p32 = cameraProjection[3][2];
@@ -635,6 +965,30 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
     m_uniforms.update(frameIndex, data);
 }
 
+void SceneRenderer::renderAmbientOcclusion(VkCommandBuffer cmd, const Scene& scene,
+                                           const glm::mat4& viewProj, const glm::mat4& projection,
+                                           VkExtent2D extent) {
+    const SceneSettings& settings = scene.settings();
+    m_occlusionValid = false;
+
+    if (!settings.ambientOcclusion || settings.aoIntensity <= 0.0f) return;
+    if (!m_occlusion.resize(extent)) return;   // empty viewport, or out of memory
+
+    // The depth of everything visible, not only what casts shadows.
+    m_occlusion.beginDepth(cmd);
+    auto view = scene.registry().view<const MeshRenderer, const WorldTransform>();
+    for (auto [entity, renderer, world] : view.each()) {
+        const MeshBuffer* mesh = m_meshes.get(renderer.mesh);
+        if (!mesh) continue;
+
+        drawDepthOnly(cmd, renderer.mesh, *mesh, overrideOf(scene, entity), viewProj * world.matrix);
+    }
+    m_occlusion.endDepth(cmd);
+
+    m_occlusion.compute(cmd, projection, std::max(settings.aoRadius, 0.01f), settings.aoIntensity);
+    m_occlusionValid = true;
+}
+
 void SceneRenderer::render(VkCommandBuffer cmd,
                            const Scene& scene,
                            const glm::mat4& viewProj,
@@ -644,6 +998,9 @@ void SceneRenderer::render(VkCommandBuffer cmd,
     // only the push constants change per object.
     m_pipeline.bind(cmd, extent);
     m_pipeline.bindDescriptorSet(cmd, m_uniforms.set(frameIndex));
+    const VkDescriptorSet environment = activeEnvironment(scene);
+    m_pipeline.bindEnvironment(cmd, environment);
+    m_pipeline.bindOcclusion(cmd, m_occlusionValid ? m_occlusion.resultSet() : m_occlusion.whiteSet());
 
     // Set 1 must be bound before the first draw; the loop rebinds it only
     // when the texture changes.
@@ -656,21 +1013,68 @@ void SceneRenderer::render(VkCommandBuffer cmd,
         if (!mesh) continue;   // MeshNone, or a model that is unknown or failed to load
 
         // The material is optional: without one, the mesh keeps its own colours.
-        glm::vec3       tint(1.0f);
-        VkDescriptorSet textureSet = m_textures.fallback();
+        // Textures set on the entity replace the model's own for those slots,
+        // its surface values replace the model's when "custom surface" is on,
+        // and the colour only tints whatever is drawn.
+        glm::vec3        tint(1.0f);
+        MaterialOverride surface;
         if (const auto* material = scene.registry().try_get<MaterialComponent>(entity)) {
-            tint       = material->baseColor;
-            textureSet = m_textures.request(material->albedoTexture);
-        }
-
-        // Neighbouring objects often share a texture; skip the redundant bind.
-        if (textureSet != boundTexture) {
-            m_pipeline.bindMaterial(cmd, textureSet);
-            boundTexture = textureSet;
+            tint    = material->baseColor;
+            surface = MaterialOverride::from(*material);
         }
 
         m_pipeline.push(cmd, MeshPushConstants{viewProj * world.matrix, world.matrix, tint});
-        mesh->draw(cmd);
+        drawMesh(cmd, m_pipeline, renderer.mesh, *mesh, surface, true, boundTexture, DrawPass::Solid);
+    }
+
+    // The sky goes next: it only fills what no solid object covered.
+    const SceneSettings& settings = scene.settings();
+    if (settings.showSky)
+        m_sky.draw(cmd, extent, environment, viewProj, std::max(settings.environmentIntensity, 0.0f));
+
+    // Translucent surfaces go last, over the sky and the solid objects, since
+    // they are mixed with whatever is already in the picture. The objects that
+    // have such parts are found first and sorted far to near by the depth of
+    // the centre of their bounding box.
+    struct Translucent {
+        entt::entity entity;
+        float        depth;   ///< Distance along the view direction (clip-space w).
+    };
+    std::vector<Translucent> translucent;
+    for (auto [entity, renderer, world] : view.each()) {
+        if (!m_meshes.get(renderer.mesh)) continue;
+        if (!hasTranslucentParts(renderer.mesh, overrideOf(scene, entity))) continue;
+
+        glm::vec3 centre(0.0f);
+        if (const std::optional<Aabb> box = m_meshes.bounds(renderer.mesh))
+            centre = 0.5f * (box->min + box->max);
+        translucent.push_back({entity, (viewProj * world.matrix * glm::vec4(centre, 1.0f)).w});
+    }
+    if (translucent.empty()) return;
+
+    std::sort(translucent.begin(), translucent.end(),
+              [](const Translucent& a, const Translucent& b) { return a.depth > b.depth; });
+
+    m_translucentPipeline.bind(cmd, extent);
+    m_translucentPipeline.bindDescriptorSet(cmd, m_uniforms.set(frameIndex));
+    m_translucentPipeline.bindEnvironment(cmd, environment);
+    m_translucentPipeline.bindOcclusion(cmd, m_occlusionValid ? m_occlusion.resultSet()
+                                                              : m_occlusion.whiteSet());
+    boundTexture = m_textures.fallback();
+    m_translucentPipeline.bindMaterial(cmd, boundTexture);
+
+    for (const Translucent& item : translucent) {
+        const auto& renderer = view.get<const MeshRenderer>(item.entity);
+        const auto& world    = view.get<const WorldTransform>(item.entity);
+        const MeshBuffer* mesh = m_meshes.get(renderer.mesh);
+
+        glm::vec3 tint(1.0f);
+        if (const auto* material = scene.registry().try_get<MaterialComponent>(item.entity))
+            tint = material->baseColor;
+
+        m_translucentPipeline.push(cmd, MeshPushConstants{viewProj * world.matrix, world.matrix, tint});
+        drawMesh(cmd, m_translucentPipeline, renderer.mesh, *mesh, overrideOf(scene, item.entity),
+                 true, boundTexture, DrawPass::Translucent);
     }
 }
 

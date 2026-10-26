@@ -102,6 +102,7 @@ void SceneFileController::doNew() {
     m_selected = entt::null;
     m_currentPath = std::filesystem::path{};
     markClean();
+    if (m_onSceneReplaced) m_onSceneReplaced();
 }
 
 void SceneFileController::doOpen(const std::filesystem::path& path) {
@@ -114,6 +115,7 @@ void SceneFileController::doOpen(const std::filesystem::path& path) {
     m_selected = entt::null;
     m_currentPath = path;
     markClean();
+    if (m_onSceneReplaced) m_onSceneReplaced();
 }
 
 bool SceneFileController::doSave(const std::filesystem::path& path) {
