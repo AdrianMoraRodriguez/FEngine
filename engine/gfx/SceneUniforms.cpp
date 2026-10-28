@@ -11,7 +11,7 @@ SceneUniforms::~SceneUniforms() { shutdown(); }
 
 bool SceneUniforms::init(const VulkanContext& ctx, const ShadowBindings& shadows) {
     m_ctx = &ctx;
-    constexpr uint32_t kFrames = Renderer::MAX_FRAMES_IN_FLIGHT + 1;   // + the preview slot
+    constexpr uint32_t kFrames = Renderer::MAX_FRAMES_IN_FLIGHT + 2;   // + the preview and probe slots
 
     // ------------------------------------------------------------------
     // 1. Layout: the contract.

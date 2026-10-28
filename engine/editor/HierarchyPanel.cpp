@@ -30,6 +30,8 @@ NodeIcon iconFor(const entt::registry& registry, entt::entity e) {
     }
     if (registry.all_of<CameraComponent>(e))
         return {FE_ICON_VIDEO, theme::tintCamera()};
+    if (registry.all_of<ReflectionProbeComponent>(e))
+        return {FE_ICON_GLOBE, theme::tintCamera()};
     if (registry.all_of<MeshRenderer>(e))
         return {FE_ICON_CUBOID, theme::tintModel()};
 
@@ -96,6 +98,13 @@ void HierarchyPanel::createLight(LightComponent::Type type) {
     m_selected = e;
 }
 
+void HierarchyPanel::createReflectionProbe() {
+    entt::entity e = m_scene.create("Reflection Probe");
+    m_scene.registry().emplace<ReflectionProbeComponent>(e);
+    m_scene.transform(e).position = {0.0f, 2.0f, 0.0f};
+    m_selected = e;
+}
+
 void HierarchyPanel::onImGui() {
     ImGui::Begin("Hierarchy");
 
@@ -129,6 +138,7 @@ void HierarchyPanel::onImGui() {
             if (ImGui::MenuItem(FE_ICON_SPOTLIGHT "  Spot"))        createLight(LightComponent::Type::Spot);
             ImGui::EndMenu();
         }
+        if (ImGui::MenuItem(FE_ICON_GLOBE "  Create Reflection Probe")) createReflectionProbe();
         ImGui::EndPopup();
     }
 

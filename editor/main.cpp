@@ -11,6 +11,8 @@
 #include "gfx/Renderer.h"
 #include "gfx/OffscreenBuffer.h"
 #include "gfx/SceneRenderer.h"
+#include "core/ProjectSettings.h"
+#include "editor/ProjectSettingsPanel.h"
 #include "import/AssetDatabase.h"
 #include "gfx/ThumbnailRenderer.h"
 #include "scene/Scene.h"
@@ -21,6 +23,7 @@
 #include "import/ImageLoader.h"
 #include "editor/ImageViewerPanel.h"
 #include "editor/ModelViewerPanel.h"
+#include "editor/MeshDistanceFieldPanel.h"
 #include "editor/FileDrop.h"
 #include "editor/EditorTheme.h"
 #include "editor/EditorCamera.h"
@@ -147,7 +150,10 @@ void shutdownImGui(VkDevice device) {
 // Dockspace
 // ---------------------------------------------------------------------------
 
-void beginDockspace(fe::SceneFileController& sceneFiles, fe::UndoHistory& undo) {
+void beginDockspace(fe::SceneFileController& sceneFiles, fe::UndoHistory& undo,
+                    fe::MeshDistanceFieldPanel& distanceFieldPanel,
+                    fe::ProjectSettingsPanel& projectSettingsPanel,
+                    fe::SceneRenderer& sceneRenderer) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -181,6 +187,13 @@ void beginDockspace(fe::SceneFileController& sceneFiles, fe::UndoHistory& undo) 
         }
         if (ImGui::BeginMenu("Edit")) {
             undo.drawMenuItems();
+            ImGui::Separator();
+            ImGui::MenuItem("Project Settings", nullptr, &projectSettingsPanel.visible);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("View")) {
+            ImGui::MenuItem("Mesh Distance Field", nullptr, &distanceFieldPanel.visible);
+            ImGui::MenuItem("Scene Distance Field", nullptr, &sceneRenderer.showDistanceField);
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
@@ -273,12 +286,19 @@ int main() {
     fe::OffscreenBuffer offscreen;
     if (!offscreen.init(vkCtx, 1280, 720)) return 1;
 
+    // The project's quality settings: read before the renderer, which sizes the
+    // meshes' distance field atlas from them. They live next to the assets.
+    const std::filesystem::path projectSettingsFile = std::filesystem::current_path() / "project_settings.json";
+    fe::ProjectSettings projectSettings;
+    projectSettings.load(projectSettingsFile);
+
     fe::SceneRenderer sceneRenderer;
-    if (!sceneRenderer.init(vkCtx, shaderDir.string().c_str())) return 1;
+    if (!sceneRenderer.init(vkCtx, shaderDir.string().c_str(), &projectSettings)) return 1;
     fe::assets::setRoot(assetsDir);
     fe::AssetDatabase::instance().scan();   // reads / creates the .meta files
 
     fe::registerBuiltinComponents();
+    fe::ComponentRegistry::instance().add<fe::ReflectionProbeComponent>("ReflectionProbe");
 
     // ---- Starting scene ----
     fe::Scene    scene;
@@ -349,11 +369,14 @@ int main() {
     fe::AssetBrowser    assetBrowser   {assetsDir};
     fe::ImageViewerPanel imageViewer   {vkCtx};
     fe::ModelViewerPanel modelViewer   {vkCtx, sceneRenderer};
+    fe::MeshDistanceFieldPanel distanceFieldPanel{scene, selectedEntity, sceneRenderer};
+    fe::ProjectSettingsPanel   projectSettingsPanel{projectSettings, projectSettingsFile};
 
     // Small pictures of the models shown in the Asset Browser, drawn on demand.
     fe::ThumbnailRenderer thumbnails;
     thumbnails.init(vkCtx, sceneRenderer);
     assetBrowser.setThumbnails(&thumbnails);
+    assetBrowser.setScene(&scene);   // the Delete dialog warns about assets the scene uses
 
     // Pictures of the image files, for their tiles.
     fe::ImageThumbnails imageThumbnails;
@@ -378,6 +401,8 @@ int main() {
         &assetBrowser,
         &imageViewer,
         &modelViewer,
+        &distanceFieldPanel,
+        &projectSettingsPanel,
     };
 
     // Mouse capture while the camera navigates (right, middle or Alt+left drag).
@@ -462,7 +487,7 @@ int main() {
         if (mouseCaptured)
             ImGui::GetIO().MouseDelta = ImVec2(captureDeltaX, captureDeltaY);
 
-        beginDockspace(sceneFiles, undoHistory);
+        beginDockspace(sceneFiles, undoHistory, distanceFieldPanel, projectSettingsPanel, sceneRenderer);
 
         for (auto* panel : panels)
             panel->onImGui();
@@ -523,6 +548,10 @@ int main() {
         sceneRenderer.renderShadows(cmd, scene, renderer.currentFrameIndex(),
                                     cameraView, cameraProjection);
 
+        // 1b. Reflection probes: photographs the scene for the ones that need it
+        //     (it opens passes of its own) and tells the shaders which are ready.
+        sceneRenderer.renderProbes(cmd, scene, renderer.currentFrameIndex());
+
         const glm::mat4 viewProj = cameraProjection * cameraView;
         const VkExtent2D extent{offscreen.width(), offscreen.height()};
 
@@ -540,10 +569,12 @@ int main() {
         // The frame index picks this frame slot's copy of the scene's lights.
         sceneRenderer.render(cmd, scene, viewProj, extent, renderer.currentFrameIndex());
 
-        // The outline of the selected entity goes over everything else.
-        sceneRenderer.drawSelectionOutline(cmd, extent);
-
         fe::Renderer::endOffscreenPass(cmd, offscreen);
+
+        // 3a. Post-processing: the HDR scene becomes the finished picture
+        //     (bloom, exposure, tone mapping), with the outline of the
+        //     selected entity drawn over it.
+        sceneRenderer.renderPostProcess(cmd, offscreen, scene);
 
         // 3b. Thumbnails of the models the Asset Browser asked for. Each one
         //     is its own small pass; the pictures appear from the next frame.

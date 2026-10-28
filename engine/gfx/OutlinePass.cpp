@@ -57,7 +57,7 @@ VkShaderModule OutlinePass::loadShader(const char* path) const {
     return module;
 }
 
-bool OutlinePass::init(const VulkanContext& ctx, VkFormat colorFormat, VkFormat depthFormat,
+bool OutlinePass::init(const VulkanContext& ctx, VkFormat colorFormat,
                        const char* shaderDir) {
     m_ctx = &ctx;
 
@@ -122,7 +122,7 @@ bool OutlinePass::init(const VulkanContext& ctx, VkFormat colorFormat, VkFormat 
     }
 
     if (!createMaskPipeline(shaderDir) ||
-        !createOutlinePipeline(colorFormat, depthFormat, shaderDir)) {
+        !createOutlinePipeline(colorFormat, shaderDir)) {
         shutdown();
         return false;
     }
@@ -357,7 +357,7 @@ bool OutlinePass::createMaskPipeline(const char* shaderDir) {
     return ok;
 }
 
-bool OutlinePass::createOutlinePipeline(VkFormat colorFormat, VkFormat depthFormat,
+bool OutlinePass::createOutlinePipeline(VkFormat colorFormat,
                                         const char* shaderDir) {
     const std::string dir = shaderDir;
     VkShaderModule vert = loadShader((dir + "/outline.vert.spv").c_str());
@@ -400,11 +400,10 @@ bool OutlinePass::createOutlinePipeline(VkFormat colorFormat, VkFormat depthForm
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisampling.rasterizationSamples = OffscreenBuffer::kSampleCount;   // drawn inside the (multisampled) scene pass
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;   // drawn over the finished image (see PostProcess)
 
-    // The scene pass has a depth attachment, so the pipeline must declare its
-    // format, but the outline neither tests nor writes depth: it is drawn over
-    // everything.
+    // The pass it is drawn in has no depth attachment, and the outline neither
+    // tests nor writes depth: it is drawn over everything.
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
 
@@ -448,7 +447,6 @@ bool OutlinePass::createOutlinePipeline(VkFormat colorFormat, VkFormat depthForm
         renderingInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         renderingInfo.colorAttachmentCount    = 1;
         renderingInfo.pColorAttachmentFormats = &colorFormat;
-        renderingInfo.depthAttachmentFormat   = depthFormat;
 
         VkGraphicsPipelineCreateInfo pipelineInfo{};
         pipelineInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;

@@ -84,6 +84,7 @@ bool TextureLibrary::init(const VulkanContext& ctx) {
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;   // idle materials give their set back
     poolInfo.maxSets       = kMaxMaterials;
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes    = poolSizes;
@@ -122,7 +123,7 @@ bool TextureLibrary::init(const VulkanContext& ctx) {
     }
 
     const MaterialRequest plain;
-    m_defaultSet = createMaterialSet(plain, {});
+    m_defaultSet = createMaterialSet(plain, {}).set;   // block 0
     if (m_defaultSet == VK_NULL_HANDLE) {
         shutdown();
         return false;
@@ -152,8 +153,12 @@ void TextureLibrary::shutdown() {
     m_pool            = VK_NULL_HANDLE;
     m_layout          = VK_NULL_HANDLE;
     m_defaultSet      = VK_NULL_HANDLE;
-    m_materialCount   = 0;
+    m_nextBlock       = 1;
+    m_freeBlocks.clear();
     m_textureCount    = 0;
+    m_frame           = 0;
+    m_nextEvictFrame  = 0;
+    m_pressure        = false;
     m_ctx             = nullptr;
 }
 
@@ -180,17 +185,19 @@ TextureLibrary::Entry* TextureLibrary::entryFor(int slot, const TextureRef& ref)
     const uint64_t cacheId = cacheKey(ref);
 
     const auto found = map.find(cacheId);
-    if (found != map.end()) return &found->second;
+    if (found != map.end()) {
+        found->second.lastUsed = m_frame;
+        return &found->second;
+    }
 
     if (m_textureCount >= kMaxTextures) {
-        if (!m_warnedTextures) {
-            FE_WARN("TextureLibrary: more than %u textures; the rest are not drawn", kMaxTextures);
-            m_warnedTextures = true;
-        }
+        // Full. update() frees what is idle; the caller tries again next frame.
+        m_pressure = true;
         return nullptr;
     }
 
     Entry& entry = map[cacheId];
+    entry.lastUsed = m_frame;
     ++m_textureCount;
 
     if (ref.source) {
@@ -220,14 +227,18 @@ TextureLibrary::Entry* TextureLibrary::entryFor(int slot, const TextureRef& ref)
     return &entry;
 }
 
-VkDescriptorSet TextureLibrary::createMaterialSet(
+TextureLibrary::MaterialInfo TextureLibrary::createMaterialSet(
         const MaterialRequest& request, const std::array<const Texture*, SlotCount>& ready) {
-    if (m_materialCount >= kMaxMaterials) {
-        if (!m_warnedMaterials) {
-            FE_WARN("TextureLibrary: more than %u materials; the rest use the default one", kMaxMaterials);
-            m_warnedMaterials = true;
-        }
-        return m_defaultSet;
+    // A block of the uniform buffer: one a freed material left, or a new one.
+    // (The default material, made first, takes block 0.)
+    uint32_t block = 0;
+    if (!m_freeBlocks.empty()) {
+        block = m_freeBlocks.back();
+    } else if (m_nextBlock < kMaxMaterials || m_defaultSet == VK_NULL_HANDLE) {
+        block = (m_defaultSet == VK_NULL_HANDLE) ? 0 : m_nextBlock;
+    } else {
+        m_pressure = true;   // full: update() frees what is idle
+        return {};
     }
 
     VkDescriptorSetAllocateInfo allocInfo{};
@@ -239,19 +250,22 @@ VkDescriptorSet TextureLibrary::createMaterialSet(
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(m_ctx->device(), &allocInfo, &set) != VK_SUCCESS) {
         FE_ERROR("TextureLibrary: cannot allocate a descriptor set");
-        return VK_NULL_HANDLE;
+        return {};
     }
 
-    // This material's block. Written now and never again: the GPU may read it
-    // for as long as the library lives.
-    const VkDeviceSize offset = kBlockStride * m_materialCount;
-    const MaterialBlock block{
+    // Only now that nothing can fail is the block taken.
+    if (!m_freeBlocks.empty() && m_defaultSet != VK_NULL_HANDLE) m_freeBlocks.pop_back();
+    else if (m_defaultSet != VK_NULL_HANDLE)                      ++m_nextBlock;
+
+    // This material's block. Written when the material is built and not again
+    // until it is freed (and then only after it has been idle for a long time).
+    const VkDeviceSize offset = kBlockStride * block;
+    const MaterialBlock blockData{
         glm::vec4(request.metallic, request.roughness, request.normalScale, 0.0f),
         glm::vec4(request.emissive, 0.0f),
         glm::vec4(static_cast<float>(request.alphaMode), request.alphaCutoff, request.opacity, 0.0f)};
-    std::memcpy(m_blockMapped + offset, &block, sizeof(block));
-    vmaFlushAllocation(m_ctx->allocator(), m_blockAllocation, offset, sizeof(block));
-    ++m_materialCount;
+    std::memcpy(m_blockMapped + offset, &blockData, sizeof(blockData));
+    vmaFlushAllocation(m_ctx->allocator(), m_blockAllocation, offset, sizeof(blockData));
 
     // A slot without a ready texture gets the neutral one.
     const Texture* neutral[SlotCount] = {&m_white, &m_whiteLinear, &m_flatNormal, &m_white};
@@ -278,7 +292,7 @@ VkDescriptorSet TextureLibrary::createMaterialSet(
     writes[SlotCount].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[SlotCount].pBufferInfo     = &blockInfo;
     vkUpdateDescriptorSets(m_ctx->device(), SlotCount + 1, writes, 0, nullptr);
-    return set;
+    return {set, block, m_frame};
 }
 
 VkDescriptorSet TextureLibrary::request(const MaterialRequest& request) {
@@ -288,8 +302,10 @@ VkDescriptorSet TextureLibrary::request(const MaterialRequest& request) {
                    request.emissive.r, request.emissive.g, request.emissive.b,
                    static_cast<float>(request.alphaMode), request.alphaCutoff, request.opacity};
 
-    if (const auto found = m_materials.find(key); found != m_materials.end())
-        return found->second;
+    if (const auto found = m_materials.find(key); found != m_materials.end()) {
+        found->second.lastUsed = m_frame;
+        return found->second.set;
+    }
 
     // Not built yet: are all its images settled?
     std::array<const Texture*, SlotCount> ready{};
@@ -299,7 +315,7 @@ VkDescriptorSet TextureLibrary::request(const MaterialRequest& request) {
         if (request.textures[i].key == 0) continue;
 
         const Entry* entry = entryFor(i, request.textures[i]);
-        if (!entry)                              continue;   // no room: neutral texture
+        if (!entry)                              { loading = true; continue; }   // no room yet: try again next frame
         if (entry->state == State::Loading)      loading = true;
         else if (entry->state == State::Ready)   ready[i] = &entry->texture;
         // Failed: neutral texture
@@ -309,14 +325,83 @@ VkDescriptorSet TextureLibrary::request(const MaterialRequest& request) {
         return m_defaultSet;
     }
 
-    const VkDescriptorSet set = createMaterialSet(request, ready);
-    if (set == VK_NULL_HANDLE) return m_defaultSet;
+    const MaterialInfo info = createMaterialSet(request, ready);
+    if (info.set == VK_NULL_HANDLE) {
+        ++m_waitingRequests;
+        return m_defaultSet;   // no room yet: not remembered, so it is tried again
+    }
 
-    m_materials.emplace(key, set);
-    return set;
+    m_materials.emplace(key, info);
+    return info.set;
+}
+
+void TextureLibrary::evictIdle() {
+    const uint64_t now = m_frame;
+    const auto idle = [now](uint64_t lastUsed) { return now - lastUsed >= kIdleFrames; };
+
+    // 1. Materials: give back the idle ones.
+    uint32_t freedMaterials = 0;
+    for (auto it = m_materials.begin(); it != m_materials.end();) {
+        if (idle(it->second.lastUsed)) {
+            vkFreeDescriptorSets(m_ctx->device(), m_pool, 1, &it->second.set);
+            m_freeBlocks.push_back(it->second.block);
+            it = m_materials.erase(it);
+            ++freedMaterials;
+        } else {
+            ++it;
+        }
+    }
+
+    // 2. Textures: which are still used by a material that stays?
+    std::unordered_map<uint64_t, bool> usedColor, usedData;
+    for (const auto& [key, info] : m_materials) {
+        for (int slot = 0; slot < SlotCount; ++slot)
+            if (key.textures[slot]) (isColorSlot(slot) ? usedColor : usedData)[key.textures[slot]] = true;
+    }
+
+    // 3. Free the idle ones nothing uses. One still loading is left alone
+    //    (its decode runs on another thread and is waited for when it is
+    //    destroyed); it is looked at again on a later pass.
+    uint32_t freedTextures = 0;
+    for (EntryMap* map : {&m_colorTextures, &m_dataTextures}) {
+        const auto& used = (map == &m_colorTextures) ? usedColor : usedData;
+        for (auto it = map->begin(); it != map->end();) {
+            if (it->second.state != State::Loading && idle(it->second.lastUsed) && !used.count(it->first)) {
+                it = map->erase(it);   // the Texture's destructor frees the GPU image
+                --m_textureCount;
+                ++freedTextures;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    if (freedMaterials || freedTextures)
+        FE_INFO("TextureLibrary: freed %u idle material(s) and %u texture(s); %u textures and %u materials left",
+                freedMaterials, freedTextures, m_textureCount, static_cast<uint32_t>(m_materials.size()));
 }
 
 void TextureLibrary::update() {
+    ++m_frame;
+
+    // Free what is idle when the library fills up (or has refused a request),
+    // at most once a second or so: a pass looks at every material.
+    const bool crowded = m_textureCount > kMaxTextures * 3 / 4 ||
+                         m_materials.size() > kMaxMaterials * 3 / 4;
+    if ((crowded || m_pressure) && m_frame >= m_nextEvictFrame) {
+        evictIdle();
+        m_nextEvictFrame = m_frame + 60;
+
+        // Still no room after freeing everything idle: all of it is in use.
+        if (m_pressure && (m_textureCount >= kMaxTextures || m_materials.size() + 1 >= kMaxMaterials) &&
+            !m_warnedTextures) {
+            FE_WARN("TextureLibrary: more than %u textures or %u materials in use at once; "
+                    "the objects that do not fit are drawn untextured", kMaxTextures, kMaxMaterials);
+            m_warnedTextures = true;
+        }
+        m_pressure = false;
+    }
+
     int uploads = 0;
 
     for (EntryMap* map : {&m_colorTextures, &m_dataTextures}) {

@@ -370,7 +370,7 @@ void Renderer::beginOffscreenPass(VkCommandBuffer cmd,
     transitionImage(cmd, offscreen.msaaImage(),
                     VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    transitionImage(cmd, offscreen.image(),
+    transitionImage(cmd, offscreen.hdrImage(),
                     VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
@@ -382,16 +382,21 @@ void Renderer::beginOffscreenPass(VkCommandBuffer cmd,
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     // Draw into the multisampled image; at the end of the pass the samples
-    // of each pixel are averaged into the ordinary image, which is what is
-    // kept. The multisampled one is not stored.
+    // of each pixel are averaged into the HDR image, which is what is kept
+    // (PostProcess turns it into the finished picture). The multisampled one
+    // is not stored.
     colorAttachment.imageView          = offscreen.msaaView();
     colorAttachment.imageLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachment.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
-    colorAttachment.resolveImageView   = offscreen.imageView();
+    colorAttachment.resolveImageView   = offscreen.hdrView();
     colorAttachment.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachment.loadOp             = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp            = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAttachment.clearValue.color = {{0.18f, 0.18f, 0.22f, 1.0f}};
+    // The colour behind the scene when no sky is drawn. It is linear light, and
+    // these numbers are chosen so that, after the default tone mapping (which
+    // takes a little off the darkest light) and the screen encoding, it shows
+    // as the dark grey-blue (0.18, 0.18, 0.22).
+    colorAttachment.clearValue.color = {{0.0605f, 0.0605f, 0.0734f, 1.0f}};
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -418,7 +423,8 @@ void Renderer::endOffscreenPass(VkCommandBuffer cmd,
                                 const OffscreenBuffer& offscreen) {
     vkCmdEndRendering(cmd);
 
-    transitionImage(cmd, offscreen.image(),
+    // PostProcess reads the HDR image next.
+    transitionImage(cmd, offscreen.hdrImage(),
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }

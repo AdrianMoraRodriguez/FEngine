@@ -107,10 +107,11 @@ public:
     void endSwapchainPass();
 
     /**
-     * @brief Opens a render pass on the offscreen colour + depth targets.
+     * @brief Opens a render pass on the offscreen HDR colour + depth targets.
      *
-     * Transitions both images and clears them (colour to the scene
-     * background, depth to 1.0).
+     * Transitions the images and clears them (colour to the scene
+     * background, as linear light; depth to 1.0). The finished 8-bit image is
+     * not touched here: PostProcess::render() makes it from the HDR one.
      *
      * @param cmd       Command buffer from currentCommandBuffer().
      * @param offscreen Target buffer.
@@ -119,10 +120,10 @@ public:
                                    const OffscreenBuffer& offscreen);
 
     /**
-     * @brief Closes the offscreen pass and makes the colour image readable.
+     * @brief Closes the offscreen pass and makes the HDR image readable.
      *
-     * Transitions the colour image to SHADER_READ_ONLY_OPTIMAL so ImGui can
-     * sample it.
+     * Transitions the HDR image to SHADER_READ_ONLY_OPTIMAL so PostProcess
+     * can sample it.
      */
     static void endOffscreenPass(VkCommandBuffer cmd,
                                  const OffscreenBuffer& offscreen);

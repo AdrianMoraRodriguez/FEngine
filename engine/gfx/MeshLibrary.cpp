@@ -74,8 +74,10 @@ bool isReady(const std::future<T>& future) {
 // Built-in primitives
 // ---------------------------------------------------------------------------
 
-bool MeshLibrary::init(const VulkanContext& ctx) {
-    m_ctx = &ctx;
+bool MeshLibrary::init(const VulkanContext& ctx, uint32_t fieldCells) {
+    m_ctx        = &ctx;
+    m_fieldCells = std::clamp(fieldCells, 8u, 128u);
+    if (!m_atlas.init(ctx, m_fieldCells)) return false;
 
     // Unit cube centred on the origin: 6 faces x 4 vertices.
     {
@@ -94,6 +96,7 @@ bool MeshLibrary::init(const VulkanContext& ctx) {
 
         if (!m_cube.upload(ctx, vertices, indices)) return false;
         m_cubeBounds = computeBounds(vertices);
+        buildDistanceFieldNow(builtin::MeshCube, vertices, indices);
     }
 
     // Unit plane in XZ facing +Y (visible from above only: back faces are culled).
@@ -112,6 +115,7 @@ bool MeshLibrary::init(const VulkanContext& ctx) {
 
         if (!m_plane.upload(ctx, vertices, indices)) return false;
         m_planeBounds = computeBounds(vertices);
+        buildDistanceFieldNow(builtin::MeshPlane, vertices, indices);
     }
 
     return true;
@@ -160,6 +164,12 @@ void MeshLibrary::shutdown() {
     m_pending.clear();
     m_abandoned.clear();
 
+    // The distance fields stop at their next triangle, so this is quick.
+    for (auto& entry : m_sdfPending) entry.second.cancel->store(true);
+    m_sdfPending.clear();
+    m_fields.clear();
+    m_atlas.shutdown();
+
     m_cube.destroy();
     m_plane.destroy();
 
@@ -193,6 +203,8 @@ void MeshLibrary::beginFrame() {
         job.future.get();
         return true;
     });
+
+    collectDistanceFields();
 }
 
 bool MeshLibrary::ensureLoaded(AssetHandle handle, bool track) {
@@ -228,6 +240,7 @@ bool MeshLibrary::ensureLoaded(AssetHandle handle, bool track) {
             return false;
         }
         entry->second.bounds = computeBounds(data->vertices);
+        buildDistanceFieldLater(handle, data->vertices, data->indices);
 
         // A model without material information is one range, no texture.
         entry->second.parts.parts = std::move(data->parts);
@@ -343,6 +356,100 @@ void MeshLibrary::cancelImport(AssetHandle handle) {
     }
 
     m_declined.insert(handle);
+}
+
+// ---------------------------------------------------------------------------
+// Distance fields
+// ---------------------------------------------------------------------------
+
+/// @return The average of the vertex colours (white for a mesh without vertices).
+static glm::vec3 averageVertexColour(const std::vector<Vertex>& vertices) {
+    if (vertices.empty()) return glm::vec3(1.0f);
+    glm::dvec3 sum(0.0);
+    for (const Vertex& v : vertices) sum += glm::dvec3(v.color);
+    return glm::vec3(sum / static_cast<double>(vertices.size()));
+}
+
+void MeshLibrary::buildDistanceFieldNow(AssetHandle handle, const std::vector<Vertex>& vertices,
+                                        const std::vector<uint32_t>& indices) {
+    std::vector<glm::vec3> positions;
+    positions.reserve(vertices.size());
+    for (const Vertex& v : vertices) positions.push_back(v.position);
+
+    auto [entry, inserted] = m_fields.try_emplace(handle);
+    entry->second.volume = buildMeshSdf(positions, indices, SdfSettings{m_fieldCells});
+    entry->second.colour = averageVertexColour(vertices);
+    if (entry->second.volume.valid()) entry->second.atlasZ = m_atlas.add(entry->second.volume);
+    if (entry->second.atlasZ == SdfAtlas::kNoSlot) m_fields.erase(entry);
+}
+
+void MeshLibrary::buildDistanceFieldLater(AssetHandle handle, const std::vector<Vertex>& vertices,
+                                          const std::vector<uint32_t>& indices) {
+    if (m_fields.count(handle) || m_sdfPending.count(handle)) return;
+
+    // The task works on its own copy: the mesh data goes away once it is uploaded.
+    std::vector<glm::vec3> positions;
+    positions.reserve(vertices.size());
+    for (const Vertex& v : vertices) positions.push_back(v.position);
+
+    PendingField job;
+    job.colour = averageVertexColour(vertices);
+    job.cancel = std::make_shared<std::atomic<bool>>(false);
+    job.future = std::async(std::launch::async,
+        [positions = std::move(positions), indices, cancel = job.cancel,
+         cells = m_fieldCells]() -> SdfVolume {
+            try {
+                return buildMeshSdf(positions, indices, SdfSettings{cells}, cancel.get());
+            } catch (const std::exception& e) {
+                FE_ERROR("Building a distance field failed: %s", e.what());
+            } catch (...) {
+                FE_ERROR("Building a distance field failed with an unknown error");
+            }
+            return SdfVolume{};
+        });
+    m_sdfPending.emplace(handle, std::move(job));
+}
+
+void MeshLibrary::collectDistanceFields() {
+    for (auto it = m_sdfPending.begin(); it != m_sdfPending.end();) {
+        if (!isReady(it->second.future)) { ++it; continue; }
+
+        const AssetHandle handle = it->first;
+        SdfVolume volume = it->second.future.get();
+        const glm::vec3 colour = it->second.colour;
+        it = m_sdfPending.erase(it);
+
+        if (!volume.valid()) {
+            FE_WARN("MeshLibrary: no distance field for '%s'", nameOf(handle).c_str());
+            continue;
+        }
+
+        auto [entry, inserted] = m_fields.try_emplace(handle);
+        entry->second.volume = std::move(volume);
+        entry->second.colour = colour;
+        entry->second.atlasZ = m_atlas.add(entry->second.volume);
+        if (entry->second.atlasZ == SdfAtlas::kNoSlot) {
+            m_fields.erase(entry);
+            continue;
+        }
+
+        FE_INFO("Distance field of '%s': %ux%ux%u cells",
+                nameOf(handle).c_str(), entry->second.volume.dims.x,
+                entry->second.volume.dims.y, entry->second.volume.dims.z);
+    }
+}
+
+std::optional<MeshLibrary::SdfPlacement> MeshLibrary::distancePlacement(AssetHandle handle) const {
+    const auto it = m_fields.find(handle);
+    if (it == m_fields.end() || it->second.atlasZ == SdfAtlas::kNoSlot) return std::nullopt;
+
+    const SdfVolume& volume = it->second.volume;
+    return SdfPlacement{volume.boxMin, volume.boxMax, volume.dims, volume.voxelSize, it->second.atlasZ, it->second.colour};
+}
+
+const SdfVolume* MeshLibrary::distanceVolume(AssetHandle handle) const {
+    const auto it = m_fields.find(handle);
+    return it != m_fields.end() ? &it->second.volume : nullptr;
 }
 
 // ---------------------------------------------------------------------------

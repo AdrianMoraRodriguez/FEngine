@@ -263,6 +263,42 @@ struct LightComponent {
     float     shadowSoftness = 0.15f;
 };
 
+/**
+ * @brief A reflection probe: a point in the scene that photographs its surroundings
+ *        so shiny surfaces nearby can reflect them.
+ *
+ * Screen-space reflections (see ScreenReflections) only know what is on screen.
+ * A probe stores what is all around its position in a small cube map, found by
+ * rendering the scene six times from there. Shiny surfaces inside its box read
+ * that cube map, with the lookup corrected so the reflection lines up with the
+ * room (the box stands for the walls), instead of reflecting the sky.
+ *
+ * The probe takes its position from the entity. It re-photographs the scene on
+ * its own a moment after the scene changes (moved objects, lights, textures
+ * finishing loading) and on the Bake button.
+ */
+struct ReflectionProbeComponent {
+    /// Brightness multiplier of what the probe reflects.
+    float intensity = 1.0f;
+
+    /// Size of the box where the probe applies, in world units, centred on the
+    /// entity (it is not rotated or scaled with the entity). It is also the
+    /// stand-in for the room's walls when correcting the reflections' parallax.
+    glm::vec3 boxSize{10.0f, 6.0f, 10.0f};
+
+    /// Width of the soft border, inside the box, over which the probe fades
+    /// into the sky's reflection (or into a neighbouring probe).
+    float blendDistance = 1.0f;
+
+    /// Whether the reflection is corrected for the box (true) or read as if the
+    /// environment were infinitely far away (false, like the sky).
+    bool boxProjection = true;
+
+    /// Raised by the Inspector's Bake button; the renderer re-photographs the
+    /// probe when it changes. Not saved.
+    uint32_t bakeSerial = 0;
+};
+
 // ---------------------------------------------------------------------------
 // JSON serialisation helpers for GLM types
 //
@@ -275,6 +311,7 @@ struct LightComponent {
 // Component serialisation — generates to_json/from_json for each struct.
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NameComponent, name)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Transform, position, rotation, scale)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ReflectionProbeComponent, intensity, boxSize, blendDistance, boxProjection)
 
 // MeshRenderer and MaterialComponent are written by hand: scenes saved before
 // assets had stable ids hold a hash of the model's path and the texture's path
@@ -368,5 +405,6 @@ bool inspect(MeshRenderer&);
 bool inspect(MaterialComponent&);
 bool inspect(CameraComponent&);
 bool inspect(LightComponent&);
+bool inspect(ReflectionProbeComponent&);
 
 } // namespace fe

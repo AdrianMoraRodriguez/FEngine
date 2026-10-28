@@ -22,11 +22,14 @@
 
 #include "core/Geometry.h"
 #include "gfx/MeshBuffer.h"
+#include "gfx/MeshDistanceField.h"
+#include "gfx/SdfAtlas.h"
 #include "import/AssetDatabase.h"
 #include "import/ImportControl.h"
 #include "import/MeshData.h"
 #include "scene/Components.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -69,9 +72,15 @@ class MeshLibrary {
 public:
     /**
      * @brief Uploads all built-in primitives to the GPU.
+     *
+     * @param ctx        Initialised Vulkan context.
+     * @param fieldCells Cells along the longest side of every mesh's distance
+     *                   field (see ProjectSettings::meshFieldResolution). Fixed
+     *                   from here on: the atlas that holds the fields is sized
+     *                   for it.
      * @return `true` on success.
      */
-    bool init(const VulkanContext& ctx);
+    bool init(const VulkanContext& ctx, uint32_t fieldCells = 64);
 
     /// Destroys all GPU buffers. Safe to call more than once.
     /// Asks imports still running in the background to stop, and waits for
@@ -102,8 +111,10 @@ public:
      *
      * Forgets which models the scene used last frame (so importStatuses()
      * only reports models still in use) and releases the memory of imports
-     * that were cancelled and have now actually stopped. SceneRenderer::
-     * prepare() calls it once per frame, before the ensureLoaded() calls.
+     * that were cancelled and have now actually stopped. It also moves the
+     * distance fields that finished building to the GPU (see distanceField()).
+     * SceneRenderer::prepare() calls it once per frame, before the
+     * ensureLoaded() calls.
      */
     void beginFrame();
 
@@ -190,6 +201,36 @@ public:
      */
     std::optional<Aabb> bounds(AssetHandle handle) const;
 
+    /// Where the distance field of a mesh is, inside the SdfAtlas.
+    struct SdfPlacement {
+        glm::vec3  boxMin{0.0f};   ///< Corner of the field, in the mesh's space.
+        glm::vec3  boxMax{0.0f};   ///< Opposite corner.
+        glm::uvec3 dims{0};        ///< Cells of the field along each axis.
+        float      voxelSize = 0.0f;
+        uint32_t   atlasZ    = 0;  ///< Where its brick starts along z of the atlas.
+        glm::vec3  colour{1.0f};   ///< Average of the mesh's vertex colours: what the reflections show of it, before the material's colour.
+    };
+
+    /**
+     * @brief Where the distance field of a mesh is in the atlas.
+     *
+     * The field is built on a background thread once the mesh is on the GPU
+     * (the built-in primitives have theirs from the start), so a model has
+     * none for a moment after it appears.
+     *
+     * @return The placement, or an empty optional if the mesh has no field on the GPU yet.
+     */
+    std::optional<SdfPlacement> distancePlacement(AssetHandle handle) const;
+
+    /// @return The texture that holds the distance fields of all meshes.
+    const SdfAtlas& distanceAtlas() const { return m_atlas; }
+
+    /// @return The CPU copy of the distance field (what distanceField() was filled from), or `nullptr`.
+    const SdfVolume* distanceVolume(AssetHandle handle) const;
+
+    /// @return How many distance fields are still being built.
+    size_t distanceFieldsPending() const { return m_sdfPending.size(); }
+
 private:
     /// A model imported from disk, with its GPU buffers.
     struct ImportedMesh {
@@ -212,6 +253,31 @@ private:
         std::future<std::optional<MeshData>> future;
         std::shared_ptr<ImportControl>       control;
     };
+
+    /// A mesh's distance field: the CPU copy, and where it went in the atlas.
+    struct DistanceFieldEntry {
+        SdfVolume volume;
+        uint32_t  atlasZ = SdfAtlas::kNoSlot;
+        glm::vec3 colour{1.0f};   ///< Average vertex colour.
+    };
+
+    /// A distance field being built on a background thread.
+    struct PendingField {
+        std::future<SdfVolume>        future;
+        glm::vec3                     colour{1.0f};   ///< Average vertex colour.
+        std::shared_ptr<std::atomic<bool>> cancel;
+    };
+
+    /// Builds the field of a mesh now (small built-in meshes only).
+    void buildDistanceFieldNow(AssetHandle handle, const std::vector<Vertex>& vertices,
+                               const std::vector<uint32_t>& indices);
+
+    /// Starts building the field of a mesh in the background.
+    void buildDistanceFieldLater(AssetHandle handle, const std::vector<Vertex>& vertices,
+                                 const std::vector<uint32_t>& indices);
+
+    /// Uploads the fields that have finished building.
+    void collectDistanceFields();
 
     const VulkanContext* m_ctx = nullptr;
 
@@ -237,6 +303,16 @@ private:
 
     /// Imported models that ensureLoaded() was asked about since beginFrame().
     std::unordered_set<AssetHandle> m_used;
+
+    /// All the distance fields on the GPU.
+    SdfAtlas m_atlas;
+    uint32_t m_fieldCells = 64;   ///< Cells along the longest side of a mesh's field.
+
+    /// Distance fields ready to be sampled, by mesh handle (built-in meshes included).
+    std::unordered_map<AssetHandle, DistanceFieldEntry> m_fields;
+
+    /// Distance fields being built.
+    std::unordered_map<AssetHandle, PendingField> m_sdfPending;
 
     /// Set by shutdown() when it left an import running.
     bool m_importsStillRunning = false;

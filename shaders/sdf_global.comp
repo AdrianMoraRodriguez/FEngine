@@ -1,0 +1,98 @@
+#version 450
+
+/// Builds the global distance field: for every cell of a volume around the
+/// camera, the distance to the nearest surface of any mesh in the scene.
+///
+/// Each cell asks every object (instance) how far it is from it, using the
+/// object's own distance field from the atlas, and keeps the smallest answer.
+/// An object that cannot be nearer than what has been found is skipped with
+/// a cheap test against its box.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+/// The global field being written: the levels stacked along z (level l uses
+/// the layers l * N .. l * N + N - 1, N being the cells per side). World-space distances.
+layout(set = 0, binding = 0, r16f) uniform writeonly image3D globalField;
+
+/// The colour (linear) of the object nearest to each cell, in the same layout,
+/// and in alpha how metallic it is. The reflections show it where they hit the field.
+layout(set = 0, binding = 3, rgba8) uniform writeonly image3D globalColour;
+
+/// All the meshes' distance fields, stacked along z (see SdfAtlas).
+layout(set = 0, binding = 1) uniform sampler3D atlas;
+
+/// One object of the scene.
+struct Instance {
+    mat4 worldToLocal;   ///< World space -> the mesh's own space.
+    vec4 boxMin;         ///< xyz: corner of the mesh's field, in the mesh's space. w: how metallic the object is (0..1).
+    vec4 boxMax;         ///< xyz: opposite corner. w: size of a cell of the mesh's field.
+    vec4 atlasInfo;      ///< x: where the brick starts along z. yzw: cells of the field.
+    vec4 extra;          ///< x: smallest scale of the object's transform: turns the mesh's distances into world distances. yzw: its colour.
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer Instances {
+    Instance instances[];
+};
+
+layout(push_constant) uniform Push {
+    vec4  origin;      ///< xyz: world position of the corner of the level. w: size of a cell.
+    uvec4 counts;      ///< x: number of instances. y: cells along each side. z: the level being built.
+    vec4  range;       ///< x: the farthest distance stored (what is farther is clamped). y: how much surfaces are inflated.
+} pc;
+
+
+/// Distance from the point (in the mesh's space) to the mesh, in the mesh's units.
+float meshDistance(Instance inst, vec3 local) {
+    const vec3  dims  = inst.atlasInfo.yzw;
+    const float voxel = inst.boxMax.w;
+
+    // Position in cells of the field, where cell i has its centre at i + 0.5.
+    vec3 g = (local - inst.boxMin.xyz) / voxel;
+
+    // Reading is kept within the centres of the brick's own cells: nothing of
+    // the neighbouring bricks leaks in. What lies beyond is the distance to
+    // that edge plus the distance read there.
+    vec3 clamped = clamp(g, vec3(0.5), dims - 0.5);
+    float outside = length(g - clamped) * voxel;
+
+    vec3 uv = vec3(clamped.xy, inst.atlasInfo.x + clamped.z) / vec3(textureSize(atlas, 0));
+    return textureLod(atlas, uv, 0.0).r + outside;
+}
+
+void main() {
+    const uint n = pc.counts.y;
+    if (any(greaterThanEqual(gl_GlobalInvocationID, uvec3(n)))) return;
+
+    const vec3 world = pc.origin.xyz + (vec3(gl_GlobalInvocationID) + 0.5) * pc.origin.w;
+
+    float best = pc.range.x;
+    vec3  colour = vec3(0.5);   // what a cell with no object in reach shows
+    float metallic = 0.0;
+    for (uint i = 0; i < pc.counts.x; ++i) {
+        const Instance inst = instances[i];
+        const vec3 local = (inst.worldToLocal * vec4(world, 1.0)).xyz;
+        const float scale = inst.extra.x;
+
+        // The box of the field is a lower bound of the distance to the mesh.
+        const vec3 centre = 0.5 * (inst.boxMin.xyz + inst.boxMax.xyz);
+        const vec3 halfSize = 0.5 * (inst.boxMax.xyz - inst.boxMin.xyz);
+        const vec3 q      = max(abs(local - centre) - halfSize, vec3(0.0));
+        if (length(q) * scale >= best) continue;
+
+        const float d = meshDistance(inst, local) * scale;
+        if (d < best) {
+            best   = d;
+            colour = inst.extra.yzw;
+            metallic = inst.boxMin.w;
+        }
+    }
+
+    // Surfaces are inflated by half a cell: a sheet thinner than the cells
+    // (a plane, a leaf) would otherwise fall between two cells and never be
+    // reached, since a distance sampled on both sides of it is never zero.
+    best -= pc.range.y;
+
+    const ivec3 cell = ivec3(gl_GlobalInvocationID) + ivec3(0, 0, int(pc.counts.z * n));
+    imageStore(globalField,  cell, vec4(best));
+    imageStore(globalColour, cell, vec4(colour, metallic));
+}

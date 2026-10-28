@@ -117,9 +117,15 @@ glm::mat4 cascadeViewProjection(const glm::vec3& direction,
 
 } // namespace
 
-bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
+const ProjectSettings& SceneRenderer::project() const {
+    static const ProjectSettings kDefaults;
+    return m_project ? *m_project : kDefaults;
+}
+
+bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir, const ProjectSettings* project) {
+    m_project = project;
     m_ctx = &ctx;
-    if (!m_meshes.init(ctx)) return false;
+    if (!m_meshes.init(ctx, this->project().meshFieldCells())) return false;
     if (!m_textures.init(ctx)) return false;   // before the pipeline: its layout is set 1
 
     // The environments come before the pipelines too: their layout is set 2.
@@ -162,30 +168,54 @@ bool SceneRenderer::init(const VulkanContext& ctx, const char* shaderDir) {
 
     if (!m_occlusion.init(ctx, shaderDir)) return false;   // before the pipeline: its layout is set 3
 
+    if (!m_reflections.init(ctx)) return false;            // before the pipeline: its layout is set 4
+    if (!m_probes.init(ctx, shaderDir)) return false;      // likewise set 5
+    if (!m_probeTarget.init(ctx, ReflectionProbes::kResolution, ReflectionProbes::kResolution)) return false;
+
+    // Before the pipelines: its sampling layout is set 6. Not essential: if the
+    // shaders are missing the field is never built and the scene simply has no
+    // software ray tracing. Only a field that cannot even be sampled is fatal.
+    static_assert(GlobalDistanceField::kLevels == kSdfLevels,
+                  "SceneUniformData must have a slot for each level of the distance field");
+    if (!m_globalField.init(ctx, shaderDir, m_meshes.distanceAtlas(),
+                            OffscreenBuffer::hdrFormat(), OffscreenBuffer::depthFormat())) {
+        FE_WARN("SceneRenderer: the scene's distance field is unavailable (are sdf_global.comp.spv and sdf_debug.frag.spv built?)");
+        if (m_globalField.sampleLayout() == VK_NULL_HANDLE) return false;
+    }
+
     if (!m_pipeline.init(ctx,
-                         OffscreenBuffer::format(),
+                         OffscreenBuffer::hdrFormat(),
                          OffscreenBuffer::depthFormat(),
                          shaderDir,
                          m_uniforms.layout(),
                          m_textures.layout(),
                          m_environmentLayout,
-                         m_occlusion.resultLayout())) return false;
+                         m_occlusion.resultLayout(),
+                         m_reflections.layout(),
+                         m_probes.layout(),
+                         m_globalField.sampleLayout())) return false;
 
     if (!m_translucentPipeline.init(ctx,
-                                    OffscreenBuffer::format(),
+                                    OffscreenBuffer::hdrFormat(),
                                     OffscreenBuffer::depthFormat(),
                                     shaderDir,
                                     m_uniforms.layout(),
                                     m_textures.layout(),
                                     m_environmentLayout,
                                     m_occlusion.resultLayout(),
+                                    m_reflections.layout(),
+                                    m_probes.layout(),
+                                    m_globalField.sampleLayout(),
                                     true)) return false;
 
-    if (!m_sky.init(ctx, OffscreenBuffer::format(), OffscreenBuffer::depthFormat(),
+    if (!m_sky.init(ctx, OffscreenBuffer::hdrFormat(), OffscreenBuffer::depthFormat(),
                     shaderDir, m_environmentLayout)) return false;
 
-    if (!m_outline.init(ctx, OffscreenBuffer::format(), OffscreenBuffer::depthFormat(), shaderDir))
+    // The outline is drawn over the finished 8-bit picture, not in the scene pass.
+    if (!m_outline.init(ctx, OffscreenBuffer::format(), shaderDir))
         return false;
+
+    if (!m_post.init(ctx, shaderDir)) return false;
 
     setupPreviewLighting();
     return true;
@@ -196,14 +226,19 @@ void SceneRenderer::shutdown() {
     if (m_defaultBake.valid()) m_defaultBake.wait();
     if (m_sceneBake.valid())   m_sceneBake.wait();
 
+    m_globalField.shutdown();
     m_sky.shutdown();
     m_occlusion.shutdown();
+    m_reflections.shutdown();
+    m_probeTarget.shutdown();
+    m_probes.shutdown();
     m_defaultEnvironment.shutdown();
     m_sceneEnvironment.shutdown();
     if (m_environmentLayout) {
         vkDestroyDescriptorSetLayout(m_ctx->device(), m_environmentLayout, nullptr);
         m_environmentLayout = VK_NULL_HANDLE;
     }
+    m_post.shutdown();
     m_outline.shutdown();
     m_translucentPipeline.shutdown();
     m_pipeline.shutdown();
@@ -496,7 +531,7 @@ void SceneRenderer::drawMesh(VkCommandBuffer cmd, const MeshPipeline& pipeline, 
 }
 
 void SceneRenderer::drawDepthOnly(VkCommandBuffer cmd, AssetHandle handle, const MeshBuffer& mesh,
-                                  const MaterialOverride& material, const glm::mat4& mvp) {
+                                  const MaterialOverride& material, const glm::mat4& mvp, bool translucentCasts) {
     const ModelParts* parts = m_meshes.parts(handle);
 
     // One part: the solid pipeline, or the cut-out one with the material that
@@ -506,9 +541,11 @@ void SceneRenderer::drawDepthOnly(VkCommandBuffer cmd, AssetHandle handle, const
         const AlphaMode fromModel = (parts && part && part->material >= 0)
                                   ? parts->materials[part->material].alphaMode : AlphaMode::Opaque;
         const AlphaMode mode = material.alphaModeOf(fromModel);
-        if (mode == AlphaMode::Blend) return;   // translucent: no shadow, no occlusion
+        if (mode == AlphaMode::Blend && !translucentCasts) return;   // no occlusion from glass
 
-        if (mode == AlphaMode::Mask)
+        // A translucent part uses the cut-out pipeline too: its shader tells the
+        // two apart by the material's alpha mode.
+        if (mode != AlphaMode::Opaque)
             m_shadowPipeline.bindMasked(cmd, m_textures.request(resolvePart(handle, parts, part, material)));
         else
             m_shadowPipeline.bind(cmd);
@@ -545,6 +582,9 @@ bool SceneRenderer::renderMeshView(VkCommandBuffer cmd, AssetHandle handle,
     m_pipeline.bindDescriptorSet(cmd, m_uniforms.set(SceneUniforms::kPreviewSlot));
     m_pipeline.bindEnvironment(cmd, m_defaultEnvironment.set());   // previews always use the built-in sky
     m_pipeline.bindOcclusion(cmd, m_occlusion.whiteSet());          // and have no occlusion
+    m_pipeline.bindReflections(cmd, m_reflections.emptySet());      // nor on-screen reflections
+    m_pipeline.bindProbes(cmd, m_probes.set());                     // nor probes (the preview data lists none)
+    m_pipeline.bindDistanceField(cmd, m_globalField.sampleSet());   // nor traced shadows (the preview data turns them off)
     VkDescriptorSet boundTexture = m_textures.fallback();
     m_pipeline.bindMaterial(cmd, boundTexture);
     m_pipeline.push(cmd, MeshPushConstants{viewProj * model, model});
@@ -557,6 +597,9 @@ bool SceneRenderer::renderMeshView(VkCommandBuffer cmd, AssetHandle handle,
         m_translucentPipeline.bindDescriptorSet(cmd, m_uniforms.set(SceneUniforms::kPreviewSlot));
         m_translucentPipeline.bindEnvironment(cmd, m_defaultEnvironment.set());
         m_translucentPipeline.bindOcclusion(cmd, m_occlusion.whiteSet());
+        m_translucentPipeline.bindReflections(cmd, m_reflections.emptySet());
+        m_translucentPipeline.bindProbes(cmd, m_probes.set());
+        m_translucentPipeline.bindDistanceField(cmd, m_globalField.sampleSet());
         boundTexture = m_textures.fallback();
         m_translucentPipeline.bindMaterial(cmd, boundTexture);
         m_translucentPipeline.push(cmd, MeshPushConstants{viewProj * model, model});
@@ -565,6 +608,9 @@ bool SceneRenderer::renderMeshView(VkCommandBuffer cmd, AssetHandle handle,
     }
 
     Renderer::endOffscreenPass(cmd, target);
+
+    // Previews are plain tone-mapped pictures: no bloom, default exposure.
+    m_post.render(cmd, target, PostSettings{});
     return true;
 }
 
@@ -639,6 +685,10 @@ SceneUniformData SceneRenderer::gatherLights(const Scene& scene) {
                 out.colorType = glm::vec4(color, kGpuLightDirectional);
                 break;
         }
+
+        // Whether or not it gets a shadow map below, the distance field
+        // shadows know this light casts.
+        out.extra.x = light.castShadows ? 1.0f : 0.0f;
 
         // A light that asks for it gets a shadow map of its own kind, while
         // there are some left: a cube for a point light, a flat map otherwise.
@@ -747,8 +797,53 @@ void SceneRenderer::drawShadowCasters(VkCommandBuffer cmd, const Scene& scene,
         if (!mesh) continue;
 
         drawDepthOnly(cmd, renderer.mesh, *mesh, overrideOf(scene, entity),
-                      lightViewProj * world.matrix);
+                      lightViewProj * world.matrix, true);
     }
+}
+
+void SceneRenderer::updateDistanceField(VkCommandBuffer cmd, const Scene& scene, uint32_t frameIndex,
+                                        const glm::mat4& cameraView) {
+    // The detail and the resolution are settings of the project; changing them rebuilds the field.
+    const ProjectSettings& quality = project();
+    static constexpr float kDetail[] = {2.0f, 1.0f, 0.5f};
+    m_globalField.setDetail(kDetail[std::clamp(quality.distanceFieldDetail, 0, 2)]);
+    static constexpr uint32_t kResolutions[] = {128, 192, 256};
+    m_globalField.setResolution(kResolutions[std::clamp(quality.distanceFieldResolution, 0, 2)]);
+
+    std::vector<SdfInstance> instances;
+
+    auto view = scene.registry().view<const MeshRenderer, const WorldTransform>();
+    for (auto [entity, renderer, world] : view.each()) {
+        const std::optional<MeshLibrary::SdfPlacement> placement = m_meshes.distancePlacement(renderer.mesh);
+        if (!placement) continue;   // no mesh, or its field is still being built
+
+        // Mesh distances become world distances by the smallest scale of the
+        // object: with an uneven scale this underestimates, which is the safe side.
+        const float scale = std::min({glm::length(glm::vec3(world.matrix[0])),
+                                      glm::length(glm::vec3(world.matrix[1])),
+                                      glm::length(glm::vec3(world.matrix[2]))});
+        if (!(scale > 1e-6f)) continue;
+
+        SdfInstance instance;
+        instance.worldToLocal = glm::inverse(world.matrix);
+        instance.boxMin       = glm::vec4(placement->boxMin, 0.0f);   // w: metallic, set below
+        instance.boxMax       = glm::vec4(placement->boxMax, placement->voxelSize);
+        instance.atlasInfo    = glm::vec4(static_cast<float>(placement->atlasZ), glm::vec3(placement->dims));
+        // What a reflection of this object shows: the average of the mesh's
+        // vertex colours times the material's colour, as the shader would
+        // multiply them. The textures are not sampled, so a textured model
+        // shows up in reflections without them.
+        glm::vec3 colour = placement->colour;
+        if (const auto* material = scene.registry().try_get<MaterialComponent>(entity)) {
+            colour *= material->baseColor;
+            if (material->customSurface) instance.boxMin.w = std::clamp(material->metallic, 0.0f, 1.0f);
+        }
+        instance.extra        = glm::vec4(scale, colour);
+        instances.push_back(instance);
+    }
+
+    const glm::vec3 eye = glm::vec3(glm::inverse(cameraView)[3]);
+    m_globalField.update(cmd, frameIndex, instances, eye);
 }
 
 void SceneRenderer::renderShadows(VkCommandBuffer cmd,
@@ -756,7 +851,32 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
                                   uint32_t frameIndex,
                                   const glm::mat4& cameraView,
                                   const glm::mat4& cameraProjection) {
+    updateDistanceField(cmd, scene, frameIndex, cameraView);
+
     SceneUniformData data = gatherLights(scene);
+
+    // Shadows traced through the distance field. Off until the field has been
+    // built, so the shader never reads a volume that holds nothing yet.
+    {
+        const int  mode        = std::clamp(scene.settings().distanceFieldShadows, 0, 2);
+        const bool reflections = scene.settings().distanceFieldReflections;
+        if ((mode > 0 || reflections) && m_globalField.ready()) {
+            data.sdfParams = glm::vec4(mode == 0 ? kSdfShadowsOff : (mode == 1 ? kSdfShadowsFill : kSdfShadowsEverywhere),
+                                       static_cast<float>(m_globalField.resolution()),
+                                       m_globalField.reach(),
+                                       reflections ? 1.0f : 0.0f);
+            for (uint32_t l = 0; l < GlobalDistanceField::kLevels; ++l)
+                data.sdfOrigin[l] = glm::vec4(m_globalField.origin(l), m_globalField.cellSize(l));
+            static constexpr float kSteps[] = {32.0f, 64.0f, 128.0f};
+            const ProjectSettings& qs = project();
+            data.sdfQuality = glm::vec4(kSteps[std::clamp(qs.distanceFieldReflectionQuality, 0, 2)],
+                                        m_globalField.cellSize(0),
+                                        qs.distanceFieldReflectionReach > 0 ? 1.0f : 0.0f,
+                                        static_cast<float>(m_globalField.instanceCount()));
+            data.sdfTuning  = glm::vec4(std::clamp(qs.distanceFieldShadowBias, 0.25f, 4.0f),
+                                        qs.distanceFieldReflectedShadows ? 1.0f : 0.0f, 0.0f, 0.0f);
+        }
+    }
 
     // Which light owns each shadow map, found from the slot gatherLights()
     // wrote into the light. -1 means the map is free this frame. Point lights
@@ -833,6 +953,20 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
     const glm::vec3 cameraPos   = glm::vec3(cameraWorld[3]);
     const glm::vec3 forward     = -glm::normalize(glm::vec3(cameraWorld[2]));
     data.cameraForward  = glm::vec4(forward, -glm::dot(forward, cameraPos));
+
+    // Screen-space reflections: on only when there is a picture of a previous
+    // frame to read (otherwise the shader would find only black).
+    m_viewProj = cameraProjection * cameraView;
+    const SceneSettings& rs = scene.settings();
+    data.viewProj     = m_viewProj;
+    data.prevViewProj = m_historyViewProj;
+    if (rs.reflections && rs.reflectionIntensity > 0.0f && m_reflections.ready()) {
+        data.ssrParams = glm::vec4(std::clamp(rs.reflectionIntensity, 0.0f, 1.0f),
+                                   std::max(rs.reflectionDistance, 1.0f),
+                                   std::max(rs.reflectionThickness, 0.01f),
+                                   m_reflections.maxMip());
+        data.ssrProj   = glm::vec4(cameraProjection[2][2], cameraProjection[3][2], 0.0f, 0.0f);
+    }
     data.cameraPosition = glm::vec4(cameraPos, 1.0f);
 
     const float p22 = cameraProjection[2][2];
@@ -963,16 +1097,26 @@ void SceneRenderer::renderShadows(VkCommandBuffer cmd,
 
     // The GPU reads the lights when the scene pass executes, later in this frame.
     m_uniforms.update(frameIndex, data);
+
+    // renderProbes() adds the probes to this and uploads it again.
+    m_frameData = data;
 }
 
 void SceneRenderer::renderAmbientOcclusion(VkCommandBuffer cmd, const Scene& scene,
                                            const glm::mat4& viewProj, const glm::mat4& projection,
                                            VkExtent2D extent) {
     const SceneSettings& settings = scene.settings();
-    m_occlusionValid = false;
+    m_occlusionValid   = false;
+    m_reflectionsDepth = false;
 
-    if (!settings.ambientOcclusion || settings.aoIntensity <= 0.0f) return;
+    const bool wantOcclusion  = settings.ambientOcclusion && settings.aoIntensity > 0.0f;
+    const bool wantReflection = settings.reflections && settings.reflectionIntensity > 0.0f;
+    if (!wantOcclusion && !wantReflection) return;
     if (!m_occlusion.resize(extent)) return;   // empty viewport, or out of memory
+
+    // The reflections look through the same depth. When it changes size they
+    // lose their picture, and say so through ready().
+    if (wantReflection) m_reflectionsDepth = m_reflections.resize(extent, m_occlusion.depthView());
 
     // The depth of everything visible, not only what casts shadows.
     m_occlusion.beginDepth(cmd);
@@ -981,12 +1125,14 @@ void SceneRenderer::renderAmbientOcclusion(VkCommandBuffer cmd, const Scene& sce
         const MeshBuffer* mesh = m_meshes.get(renderer.mesh);
         if (!mesh) continue;
 
-        drawDepthOnly(cmd, renderer.mesh, *mesh, overrideOf(scene, entity), viewProj * world.matrix);
+        drawDepthOnly(cmd, renderer.mesh, *mesh, overrideOf(scene, entity), viewProj * world.matrix, false);
     }
     m_occlusion.endDepth(cmd);
 
-    m_occlusion.compute(cmd, projection, std::max(settings.aoRadius, 0.01f), settings.aoIntensity);
-    m_occlusionValid = true;
+    if (wantOcclusion) {
+        m_occlusion.compute(cmd, projection, std::max(settings.aoRadius, 0.01f), settings.aoIntensity);
+        m_occlusionValid = true;
+    }
 }
 
 void SceneRenderer::render(VkCommandBuffer cmd,
@@ -994,13 +1140,37 @@ void SceneRenderer::render(VkCommandBuffer cmd,
                            const glm::mat4& viewProj,
                            VkExtent2D extent,
                            uint32_t frameIndex) {
+    if (showDistanceField && m_globalField.ready()) {
+        m_globalField.drawDebug(cmd, extent, glm::inverse(viewProj));
+        return;
+    }
+
+    // The picture of the last frame is only usable once it exists at this size.
+    SceneSets sets;
+    sets.uniforms    = m_uniforms.set(frameIndex);
+    sets.occlusion   = m_occlusionValid ? m_occlusion.resultSet() : m_occlusion.whiteSet();
+    sets.reflections = (m_reflectionsDepth && m_reflections.ready()) ? m_reflections.liveSet()
+                                                                     : m_reflections.emptySet();
+    sets.probes      = m_probes.set();
+    sets.distanceField = m_globalField.sampleSet();
+    drawScene(cmd, scene, viewProj, extent, sets);
+}
+
+void SceneRenderer::drawScene(VkCommandBuffer cmd,
+                              const Scene& scene,
+                              const glm::mat4& viewProj,
+                              VkExtent2D extent,
+                              const SceneSets& sets) {
     // Pipeline, dynamic state and the scene's descriptor set are bound once;
     // only the push constants change per object.
     m_pipeline.bind(cmd, extent);
-    m_pipeline.bindDescriptorSet(cmd, m_uniforms.set(frameIndex));
+    m_pipeline.bindDescriptorSet(cmd, sets.uniforms);
     const VkDescriptorSet environment = activeEnvironment(scene);
     m_pipeline.bindEnvironment(cmd, environment);
-    m_pipeline.bindOcclusion(cmd, m_occlusionValid ? m_occlusion.resultSet() : m_occlusion.whiteSet());
+    m_pipeline.bindOcclusion(cmd, sets.occlusion);
+    m_pipeline.bindReflections(cmd, sets.reflections);
+    m_pipeline.bindProbes(cmd, sets.probes);
+    m_pipeline.bindDistanceField(cmd, sets.distanceField);
 
     // Set 1 must be bound before the first draw; the loop rebinds it only
     // when the texture changes.
@@ -1056,10 +1226,14 @@ void SceneRenderer::render(VkCommandBuffer cmd,
               [](const Translucent& a, const Translucent& b) { return a.depth > b.depth; });
 
     m_translucentPipeline.bind(cmd, extent);
-    m_translucentPipeline.bindDescriptorSet(cmd, m_uniforms.set(frameIndex));
+    m_translucentPipeline.bindDescriptorSet(cmd, sets.uniforms);
     m_translucentPipeline.bindEnvironment(cmd, environment);
-    m_translucentPipeline.bindOcclusion(cmd, m_occlusionValid ? m_occlusion.resultSet()
-                                                              : m_occlusion.whiteSet());
+    // A translucent surface takes no ambient occlusion: the picture holds that of
+    // whatever is behind it, not of the glass.
+    m_translucentPipeline.bindOcclusion(cmd, m_occlusion.whiteSet());
+    m_translucentPipeline.bindReflections(cmd, sets.reflections);
+    m_translucentPipeline.bindProbes(cmd, sets.probes);
+    m_translucentPipeline.bindDistanceField(cmd, sets.distanceField);
     boundTexture = m_textures.fallback();
     m_translucentPipeline.bindMaterial(cmd, boundTexture);
 
@@ -1117,8 +1291,266 @@ void SceneRenderer::renderSelectionMask(VkCommandBuffer cmd,
     m_outlineActive = true;
 }
 
-void SceneRenderer::drawSelectionOutline(VkCommandBuffer cmd, VkExtent2D extent) {
-    if (m_outlineActive) m_outline.draw(cmd, extent);
+void SceneRenderer::renderPostProcess(VkCommandBuffer cmd, const OffscreenBuffer& target, const Scene& scene) {
+    const SceneSettings& settings = scene.settings();
+
+    // Keep this frame's picture for the next frame's reflections, before the
+    // bloom and tone mapping change it.
+    if (m_reflectionsDepth) {
+        m_reflections.capture(cmd, target.hdrImage(), VkExtent2D{target.width(), target.height()});
+        m_historyViewProj = m_viewProj;
+    } else {
+        m_reflections.invalidate();
+    }
+
+    PostSettings post;
+    post.exposure       = std::clamp(settings.exposure, -6.0f, 6.0f);
+    post.toneMapper     = static_cast<ToneMapper>(std::clamp(settings.toneMapper, 0, kToneMapperCount - 1));
+    post.bloom          = settings.bloom;
+    post.bloomIntensity = std::max(settings.bloomIntensity, 0.0f);
+    post.bloomThreshold = std::max(settings.bloomThreshold, 0.0f);
+
+    // The outline goes on the finished picture, after the tone mapping.
+    const VkExtent2D extent{target.width(), target.height()};
+    m_post.render(cmd, target, post, [this, extent](VkCommandBuffer commands) {
+        if (m_outlineActive) m_outline.draw(commands, extent);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Reflection probes
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Frames the scene (or a probe) must stay unchanged before a probe is photographed
+/// again: long enough not to re-photograph on every step of a drag.
+constexpr uint32_t kProbeSettleFrames = 30;
+
+/// Frames after the scene settles before the second photograph, which picks up
+/// the textures that were still loading the first time.
+constexpr uint32_t kProbeFollowUpFrames = 150;
+
+/// Where the cube maps are photographed to: the far end of the faces' view.
+constexpr float kProbeNear = 0.05f;
+constexpr float kProbeFar  = 500.0f;
+
+} // namespace
+
+uint64_t SceneRenderer::hashScene(const Scene& scene) const {
+    // FNV-1a over the numbers that decide what a photograph would show.
+    uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&hash](const void* data, size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < size; ++i) { hash ^= bytes[i]; hash *= 1099511628211ull; }
+    };
+    const auto mixValue = [&mix](const auto& value) { mix(&value, sizeof(value)); };
+
+    const auto& registry = scene.registry();
+
+    for (auto [entity, renderer, world] : registry.view<const MeshRenderer, const WorldTransform>().each()) {
+        mixValue(renderer.mesh);
+        mixValue(renderer.castShadows);
+        mixValue(world.matrix);
+        if (const auto* material = registry.try_get<MaterialComponent>(entity)) {
+            mixValue(material->baseColor);
+            mixValue(material->albedoTexture);
+            mixValue(material->customSurface);
+            mixValue(material->metallic);
+            mixValue(material->roughness);
+            mixValue(material->emissiveColor);
+            mixValue(material->emissiveIntensity);
+            mixValue(material->opacity);
+        }
+    }
+
+    for (auto [entity, light, world] : registry.view<const LightComponent, const WorldTransform>().each()) {
+        mixValue(light.type);
+        mixValue(light.color);
+        mixValue(light.intensity);
+        mixValue(light.range);
+        mixValue(light.castShadows);
+        mixValue(world.matrix);
+    }
+
+    const SceneSettings& settings = scene.settings();
+    mixValue(settings.ambientColor);
+    mixValue(settings.ambientIntensity);
+    mixValue(settings.environment);
+    mixValue(settings.environmentIntensity);
+    mixValue(settings.showSky);
+    mixValue(settings.distanceFieldShadows);
+    mixValue(settings.distanceFieldReflections);
+
+    // What the project asks of the distance field changes what the probes see.
+    const ProjectSettings& quality = project();
+    mixValue(quality.distanceFieldDetail);
+    mixValue(quality.distanceFieldResolution);
+    mixValue(quality.distanceFieldReflectionQuality);
+    mixValue(quality.distanceFieldReflectionReach);
+    mixValue(quality.distanceFieldShadowBias);
+    mixValue(quality.distanceFieldReflectedShadows);
+    return hash;
+}
+
+void SceneRenderer::bakeProbe(VkCommandBuffer cmd, const Scene& scene, uint32_t slot,
+                              const glm::vec3& position) {
+    // The photograph is seen from the probe: the specular highlights need to
+    // know where the eye is. Everything else of the frame's data stays (lights,
+    // shadows, the sky), and the effects that need a screen or other probes are off.
+    // The slot is written by the CPU, so the GPU must be done with its last use.
+    vkDeviceWaitIdle(m_ctx->device());
+
+    SceneUniformData data = m_frameData;
+    data.cameraPosition = glm::vec4(position, 1.0f);
+    data.ssrParams      = glm::vec4(0.0f);
+    data.probeCount     = glm::ivec4(0);
+    m_uniforms.update(SceneUniforms::kProbeSlot, data);
+
+    SceneSets sets;
+    sets.uniforms    = m_uniforms.set(SceneUniforms::kProbeSlot);
+    sets.occlusion   = m_occlusion.whiteSet();
+    sets.reflections = m_reflections.emptySet();
+    sets.probes      = m_probes.set();
+    sets.distanceField = m_globalField.sampleSet();
+
+    const VkExtent2D extent{ReflectionProbes::kResolution, ReflectionProbes::kResolution};
+    const glm::mat4  projection = ReflectionProbes::faceProjection(kProbeNear, kProbeFar);
+
+    m_probes.beginCapture(cmd);
+    for (uint32_t face = 0; face < ReflectionProbes::kFaces; ++face) {
+        const glm::mat4 viewProj = projection * ReflectionProbes::faceView(face, position);
+
+        Renderer::beginOffscreenPass(cmd, m_probeTarget);
+        drawScene(cmd, scene, viewProj, extent, sets);
+        Renderer::endOffscreenPass(cmd, m_probeTarget);
+
+        m_probes.captureFace(cmd, m_probeTarget.hdrImage(), face);
+    }
+    m_probes.filter(cmd, slot);
+
+    FE_INFO("SceneRenderer: photographed reflection probe %u at (%.1f, %.1f, %.1f)",
+            slot, position.x, position.y, position.z);
+}
+
+void SceneRenderer::renderProbes(VkCommandBuffer cmd, const Scene& scene, uint32_t frameIndex) {
+    // Switched off: nothing is photographed and the frame's data lists no probes.
+    // Their slots are kept, so turning them on again finds the pictures it left
+    // (and re-photographs them if the scene changed meanwhile).
+    if (!scene.settings().reflectionProbes) return;
+
+    // ---- Which probes are in the scene, and which slot each one uses ----
+    struct Found {
+        uint64_t                          id;
+        glm::vec3                         position;
+        const ReflectionProbeComponent*   probe;
+    };
+    std::array<Found, kMaxReflectionProbes> found{};
+    uint32_t count = 0;
+
+    auto probes = scene.registry().view<const ReflectionProbeComponent, const WorldTransform, const IDComponent>();
+    for (auto [entity, probe, world, id] : probes.each()) {
+        if (count >= kMaxReflectionProbes) {
+            static bool warned = false;
+            if (!warned) {
+                FE_WARN("SceneRenderer: more than %u reflection probes in the scene; the extra ones are ignored",
+                        kMaxReflectionProbes);
+                warned = true;
+            }
+            break;
+        }
+        found[count++] = {static_cast<uint64_t>(id.uuid), glm::vec3(world.matrix[3]), &probe};
+    }
+
+    // A slot belongs to a probe for as long as it exists (found by its UUID).
+    // Slots of probes that are gone are freed; new probes take a free one.
+    std::array<int, kMaxReflectionProbes> slotOf{};
+    slotOf.fill(-1);
+    for (ProbeSlot& slot : m_probeSlots) {
+        bool alive = false;
+        for (uint32_t i = 0; i < count; ++i) alive |= (found[i].id == slot.id);
+        if (!alive) slot = ProbeSlot{};
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        for (uint32_t s = 0; s < kMaxReflectionProbes; ++s)
+            if (m_probeSlots[s].id == found[i].id) { slotOf[i] = static_cast<int>(s); break; }
+        if (slotOf[i] >= 0) continue;
+        for (uint32_t s = 0; s < kMaxReflectionProbes; ++s) {
+            if (m_probeSlots[s].id != 0) continue;
+            m_probeSlots[s] = ProbeSlot{};
+            m_probeSlots[s].id           = found[i].id;
+            m_probeSlots[s].lastPosition = found[i].position;
+            slotOf[i] = static_cast<int>(s);
+            break;
+        }
+    }
+    if (count == 0) return;   // the frame's data already lists no probes
+
+    // ---- When the scene has changed, every probe is photographed again, once it settles ----
+    const uint64_t hash = hashScene(scene);
+    if (hash != m_probeSceneHash) {
+        m_probeSceneHash   = hash;
+        m_probeSceneStill  = 0;
+        m_probeStale       = true;
+        m_probeStaleFollow = false;
+        m_probeFollowUp    = 0;
+    } else if (m_probeSceneStill < kProbeSettleFrames) {
+        ++m_probeSceneStill;
+    }
+    if (m_probeFollowUp > 0 && --m_probeFollowUp == 0) {
+        m_probeStale       = true;
+        m_probeStaleFollow = true;
+    }
+    if (m_probeStale && m_probeSceneStill >= kProbeSettleFrames) {
+        for (ProbeSlot& slot : m_probeSlots)
+            if (slot.id != 0) slot.dirty = true;
+        m_probeStale = false;
+        if (!m_probeStaleFollow) m_probeFollowUp = kProbeFollowUpFrames;
+    }
+
+    // ---- One photograph per frame at most ----
+    bool baked = false;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (slotOf[i] < 0) continue;
+        ProbeSlot& slot = m_probeSlots[static_cast<uint32_t>(slotOf[i])];
+
+        // A moved probe waits until it stays still (a drag moves it every frame).
+        slot.stillFrames = (found[i].position == slot.lastPosition) ? slot.stillFrames + 1 : 0;
+        slot.lastPosition = found[i].position;
+        const bool moved = slot.baked && slot.stillFrames >= kProbeSettleFrames &&
+                           glm::distance(found[i].position, slot.bakedPosition) > 1e-3f;
+
+        const bool needed = !slot.baked || slot.dirty || moved ||
+                            found[i].probe->bakeSerial != slot.bakedSerial;
+        if (!needed || baked) continue;
+
+        bakeProbe(cmd, scene, static_cast<uint32_t>(slotOf[i]), found[i].position);
+        slot.baked         = true;
+        slot.dirty         = false;
+        slot.bakedPosition = found[i].position;
+        slot.bakedSerial   = found[i].probe->bakeSerial;
+        baked = true;
+    }
+
+    // ---- The probes that are ready go to the shaders ----
+    SceneUniformData data = m_frameData;
+    int used = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (slotOf[i] < 0) continue;
+        const ProbeSlot& slot = m_probeSlots[static_cast<uint32_t>(slotOf[i])];
+        if (!slot.baked) continue;
+
+        const ReflectionProbeComponent& probe = *found[i].probe;
+        const glm::vec3 half = 0.5f * glm::max(probe.boxSize, glm::vec3(0.5f));
+        data.probeBoxMin[used]   = glm::vec4(found[i].position - half, std::max(probe.intensity, 0.0f));
+        data.probeBoxMax[used]   = glm::vec4(found[i].position + half, std::max(probe.blendDistance, 0.0f));
+        data.probePosition[used] = glm::vec4(slot.bakedPosition, probe.boxProjection ? 1.0f : 0.0f);
+        data.probeLayer[used]    = glm::vec4(static_cast<float>(slotOf[i]), 0.0f, 0.0f, 0.0f);
+        ++used;
+    }
+    data.probeCount = glm::ivec4(used, 0, 0, 0);
+    m_frameData = data;
+    m_uniforms.update(frameIndex, data);
 }
 
 entt::entity SceneRenderer::pick(const Scene& scene, const Ray& ray,

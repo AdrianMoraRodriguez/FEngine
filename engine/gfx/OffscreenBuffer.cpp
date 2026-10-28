@@ -83,7 +83,8 @@ bool OffscreenBuffer::create(uint32_t width, uint32_t height) {
 
     // A buffer that shares the multisampled images uses the other buffer's.
     if (m_shared) {
-        if (m_shared->m_width != width || m_shared->m_height != height || !m_shared->m_msaaImage) {
+        if (m_shared->m_width != width || m_shared->m_height != height || !m_shared->m_msaaImage ||
+        !m_shared->m_hdrImage) {
             FE_ERROR("OffscreenBuffer: the shared multisampled images do not match (%ux%u)", width, height);
             return false;
         }
@@ -91,13 +92,41 @@ bool OffscreenBuffer::create(uint32_t width, uint32_t height) {
         m_msaaView  = m_shared->m_msaaView;
         m_depthImage = m_shared->m_depthImage;
         m_depthView  = m_shared->m_depthView;
+        m_hdrImage   = m_shared->m_hdrImage;
+        m_hdrView    = m_shared->m_hdrView;
+        m_hdrDescSet = m_shared->m_hdrDescSet;
     } else {
+    // ------------------------------------------------------------------
+    // 1b. HDR image: the scene pass averages its samples into it, and
+    //     PostProcess reads it. Floating point, so light brighter than 1 is kept.
+    // ------------------------------------------------------------------
+    VkImageCreateInfo hdrInfo = imageInfo;
+    hdrInfo.format = hdrFormat();
+    hdrInfo.usage  = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                   | VK_IMAGE_USAGE_SAMPLED_BIT
+                   | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;   // ScreenReflections keeps a copy of it for the next frame
+
+    if (vmaCreateImage(m_ctx->allocator(), &hdrInfo, &allocInfo,
+                       &m_hdrImage, &m_hdrAllocation, nullptr) != VK_SUCCESS) {
+        FE_ERROR("OffscreenBuffer: failed to create the HDR image (%ux%u)", width, height);
+        return false;
+    }
+
+    VkImageViewCreateInfo hdrViewInfo = viewInfo;
+    hdrViewInfo.image  = m_hdrImage;
+    hdrViewInfo.format = hdrFormat();
+    if (vkCreateImageView(m_ctx->device(), &hdrViewInfo, nullptr, &m_hdrView) != VK_SUCCESS) {
+        FE_ERROR("OffscreenBuffer: failed to create the HDR image view");
+        return false;
+    }
+
     // ------------------------------------------------------------------
     // 2. Multisampled colour image: what the scene pass really draws into.
     //    Its contents are averaged into the image above at the end of the
     //    pass and never read again, so the GPU may keep them in tile memory.
     // ------------------------------------------------------------------
     VkImageCreateInfo msaaInfo = imageInfo;
+    msaaInfo.format  = hdrFormat();
     msaaInfo.samples = kSampleCount;
     msaaInfo.usage   = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                      | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
@@ -114,7 +143,8 @@ bool OffscreenBuffer::create(uint32_t width, uint32_t height) {
     }
 
     VkImageViewCreateInfo msaaViewInfo = viewInfo;
-    msaaViewInfo.image = m_msaaImage;
+    msaaViewInfo.image  = m_msaaImage;
+    msaaViewInfo.format = hdrFormat();
     if (vkCreateImageView(m_ctx->device(), &msaaViewInfo, nullptr, &m_msaaView) != VK_SUCCESS) {
         FE_ERROR("OffscreenBuffer: failed to create the multisampled colour view");
         return false;
@@ -178,7 +208,56 @@ bool OffscreenBuffer::create(uint32_t width, uint32_t height) {
         return false;
     }
 
-    FE_INFO("OffscreenBuffer created: %ux%u (colour + depth, %ux multisampled)",
+    // The set PostProcess reads the HDR image through (borrowed if shared).
+    if (!m_shared) {
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding         = 0;
+        binding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1;
+        binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings    = &binding;
+
+        const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets       = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes    = &poolSize;
+
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorSetCount = 1;
+
+        if (vkCreateDescriptorSetLayout(m_ctx->device(), &layoutInfo, nullptr, &m_hdrLayout) != VK_SUCCESS ||
+            vkCreateDescriptorPool(m_ctx->device(), &poolInfo, nullptr, &m_hdrPool) != VK_SUCCESS) {
+            FE_ERROR("OffscreenBuffer: failed to create the HDR descriptor set layout or pool");
+            return false;
+        }
+        allocInfo.descriptorPool = m_hdrPool;
+        allocInfo.pSetLayouts    = &m_hdrLayout;
+        if (vkAllocateDescriptorSets(m_ctx->device(), &allocInfo, &m_hdrDescSet) != VK_SUCCESS) {
+            FE_ERROR("OffscreenBuffer: failed to allocate the HDR descriptor set");
+            return false;
+        }
+
+        VkDescriptorImageInfo image{};
+        image.sampler     = m_sampler;
+        image.imageView   = m_hdrView;
+        image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write{};
+        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet          = m_hdrDescSet;
+        write.descriptorCount = 1;
+        write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo      = &image;
+        vkUpdateDescriptorSets(m_ctx->device(), 1, &write, 0, nullptr);
+    }
+
+    FE_INFO("OffscreenBuffer created: %ux%u (HDR colour + depth, %ux multisampled)",
             width, height, static_cast<unsigned>(kSampleCount));
     return true;
 }
@@ -189,6 +268,15 @@ void OffscreenBuffer::destroy() {
     if (m_imguiDescSet) {
         ImGui_ImplVulkan_RemoveTexture(m_imguiDescSet);
         m_imguiDescSet = VK_NULL_HANDLE;
+    }
+    m_hdrDescSet = VK_NULL_HANDLE;   // freed with its pool
+    if (m_hdrPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_ctx->device(), m_hdrPool, nullptr);
+        m_hdrPool = VK_NULL_HANDLE;
+    }
+    if (m_hdrLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(m_ctx->device(), m_hdrLayout, nullptr);
+        m_hdrLayout = VK_NULL_HANDLE;
     }
     if (m_sampler != VK_NULL_HANDLE) {
         vkDestroySampler(m_ctx->device(), m_sampler, nullptr);
@@ -206,7 +294,17 @@ void OffscreenBuffer::destroy() {
     if (m_shared) {   // the multisampled images belong to the other buffer
         m_msaaImage = VK_NULL_HANDLE;  m_msaaView = VK_NULL_HANDLE;
         m_depthImage = VK_NULL_HANDLE; m_depthView = VK_NULL_HANDLE;
+        m_hdrImage   = VK_NULL_HANDLE; m_hdrView   = VK_NULL_HANDLE;
         return;
+    }
+    if (m_hdrView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_ctx->device(), m_hdrView, nullptr);
+        m_hdrView = VK_NULL_HANDLE;
+    }
+    if (m_hdrImage != VK_NULL_HANDLE) {
+        vmaDestroyImage(m_ctx->allocator(), m_hdrImage, m_hdrAllocation);
+        m_hdrImage      = VK_NULL_HANDLE;
+        m_hdrAllocation = VK_NULL_HANDLE;
     }
     if (m_msaaView != VK_NULL_HANDLE) {
         vkDestroyImageView(m_ctx->device(), m_msaaView, nullptr);

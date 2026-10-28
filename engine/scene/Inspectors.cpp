@@ -273,4 +273,34 @@ bool inspect(LightComponent& l) {
     return changed;
 }
 
+bool inspect(ReflectionProbeComponent& p) {
+    bool changed = false;
+
+    changed |= ImGui::DragFloat("Intensity", &p.intensity, 0.01f, 0.0f, 10.0f, "%.2f");
+    p.intensity = std::max(p.intensity, 0.0f);
+
+    changed |= ImGui::DragFloat3("Box Size", glm::value_ptr(p.boxSize), 0.1f, 0.5f, 1000.0f, "%.1f");
+    p.boxSize = glm::max(p.boxSize, glm::vec3(0.5f));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Where the probe applies, centred on the entity.\nIt also stands for the room's walls when correcting the reflections.");
+
+    changed |= ImGui::DragFloat("Blend Distance", &p.blendDistance, 0.05f, 0.0f, 50.0f, "%.2f");
+    p.blendDistance = std::max(p.blendDistance, 0.0f);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Soft border inside the box, where the probe fades into\nthe sky or into a neighbouring probe.");
+
+    changed |= ImGui::Checkbox("Box Projection", &p.boxProjection);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Corrects the reflection for the box, so it lines up with the room.\nTurn off for open spaces.");
+
+    if (ImGui::Button("Bake")) {
+        ++p.bakeSerial;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Photographs the scene again from here. It also happens by itself\na moment after the scene changes.");
+
+    return changed;
+}
+
 } // namespace fe

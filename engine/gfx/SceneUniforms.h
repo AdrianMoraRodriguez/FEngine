@@ -15,6 +15,7 @@
 #include <vk_mem_alloc.h>
 #include <glm/glm.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,17 @@ constexpr uint32_t kMaxPointShadowCasters = 2;
 /// Number of cascades of the sun's cascaded shadow map (see ShadowCascades).
 constexpr uint32_t kShadowCascades = 4;
 
+/// Most reflection probes the scene can use at once (see ReflectionProbes).
+constexpr uint32_t kMaxReflectionProbes = 8;
+
+/// Number of levels of the global distance field (GlobalDistanceField::kLevels).
+constexpr uint32_t kSdfLevels = 3;
+
+/// Values of SceneUniformData::sdfParams.x: which lights trace the distance field for their shadows.
+constexpr float kSdfShadowsOff        = 0.0f;   ///< None: only shadow maps.
+constexpr float kSdfShadowsFill       = 1.0f;   ///< Where the shadow maps do not reach: past the sun's cascades, and lights without a map.
+constexpr float kSdfShadowsEverywhere = 2.0f;   ///< Every light that casts, instead of its shadow map.
+
 /// Values of GpuLight::colorType.w.
 constexpr float kGpuLightDirectional = 0.0f;
 constexpr float kGpuLightPoint       = 1.0f;
@@ -45,7 +57,7 @@ constexpr float kGpuLightSpot        = 2.0f;
 /**
  * @brief One light as the shader sees it. Mirrors `Light` in mesh.frag.
  *
- * Four `vec4`s, so every member starts on a 16-byte boundary (std140) and
+ * Five `vec4`s, so every member starts on a 16-byte boundary (std140) and
  * the C++ and GLSL layouts agree without any padding on our side.
  */
 struct GpuLight {
@@ -70,6 +82,11 @@ struct GpuLight {
     /// w: 1 for the one directional light whose shadows are cascaded (it then
     ///    uses the cascades instead of a flat map, and z is 0), else 0.
     glm::vec4 spotCone{0.0f, 0.0f, -1.0f, 0.0f};
+
+    /// x: 1 if the light casts shadows at all, whether or not it got a shadow
+    /// map. The distance field shadows (see sdfParams) read it to know which
+    /// lights to trace. yzw: unused.
+    glm::vec4 extra{0.0f};
 };
 
 /**
@@ -128,9 +145,65 @@ struct SceneUniformData {
     /// x: how bright the environment's light is (a multiplier; 0 turns it off).
     /// yzw: unused.
     glm::vec4 environmentParams{1.0f, 0.0f, 0.0f, 0.0f};
+
+    /// World space -> clip space of the camera drawing this frame. The
+    /// reflections march their rays through the screen with it.
+    glm::mat4 viewProj{1.0f};
+
+    /// The same matrix for the camera of the picture the reflections read their
+    /// colour from (the previous frame; see ScreenReflections).
+    glm::mat4 prevViewProj{1.0f};
+
+    /// Screen-space reflections.
+    /// x: how strongly they replace the sky's reflection (0 = off, 1 = fully).
+    /// y: farthest a reflected ray travels, in world units.
+    /// z: how far behind a surface a ray may be and still count as hitting it.
+    /// w: highest mip level of the previous picture (what a fully rough surface reads).
+    glm::vec4 ssrParams{0.0f};
+
+    /// x, y: the projection's [2][2] and [3][2], to turn a stored depth back
+    /// into a distance in front of the camera. zw: unused.
+    glm::vec4 ssrProj{0.0f};
+
+    /// x: how many entries of the probe arrays are in use. yzw: unused.
+    glm::ivec4 probeCount{0};
+
+    /// For each probe. xyz: the low corner of its box (world space). w: its intensity.
+    glm::vec4 probeBoxMin[kMaxReflectionProbes]{};
+
+    /// For each probe. xyz: the high corner of its box. w: width of its soft border.
+    glm::vec4 probeBoxMax[kMaxReflectionProbes]{};
+
+    /// For each probe. xyz: where the scene was photographed from.
+    /// w: 1 if the reflection is corrected for the box, 0 if not.
+    glm::vec4 probePosition[kMaxReflectionProbes]{};
+
+    /// For each probe. x: its layer in the probe cube map array. yzw: unused.
+    glm::vec4 probeLayer[kMaxReflectionProbes]{};
+
+    /// For each level of the global distance field (see GlobalDistanceField).
+    /// xyz: world position of the level's low corner. w: size of one of its cells.
+    glm::vec4 sdfOrigin[kSdfLevels]{};
+
+    /// Shadows traced through the global distance field.
+    /// x: which lights use them (kSdfShadows*). y: cells along one side of a level.
+    /// z: farthest a ray travels, in world units.
+    /// w: 1 if shiny surfaces reflect what the field holds, 0 if not.
+    glm::vec4 sdfParams{0.0f};
+
+    /// Reflections traced through the distance field.
+    /// x: most steps of a ray. y: size of a cell of the finest level.
+    /// z: 1 to also trust hits in the second level, 0 for the finest only.
+    /// w: how many objects the field holds (the meshes' own fields traced at a hit).
+    glm::vec4 sdfQuality{64.0f, 0.125f, 0.0f, 0.0f};
+
+    /// Tuning of the traced rays.
+    /// x: how far above a surface a shadow ray starts, in cells.
+    /// y: 1 if what the reflections show is shadowed too. zw: unused.
+    glm::vec4 sdfTuning{1.0f, 1.0f, 0.0f, 0.0f};
 };
 
-static_assert(sizeof(GpuLight) == 64,
+static_assert(sizeof(GpuLight) == 80,
               "GpuLight must match the std140 struct in mesh.frag");
 static_assert(offsetof(SceneUniformData, shadowViewProj) == 32,
               "The shadow matrices must start right after the two vec4s");
@@ -140,13 +213,14 @@ static_assert(offsetof(SceneUniformData, pointShadowParams) == 32 + 80 * kMaxSha
               "The cube shadow parameters must follow the flat shadow data");
 static_assert(offsetof(SceneUniformData, lights) == 48 + 80 * kMaxShadowCasters,
               "The light array must start after the shadow data");
-static_assert(offsetof(SceneUniformData, cascadeViewProj) == 48 + 80 * kMaxShadowCasters + 64 * kMaxLights,
+static_assert(offsetof(SceneUniformData, cascadeViewProj) == 48 + 80 * kMaxShadowCasters + 80 * kMaxLights,
               "The cascade data must follow the light array");
 static_assert(offsetof(SceneUniformData, cameraForward) ==
-              48 + 80 * kMaxShadowCasters + 64 * kMaxLights + 80 * kShadowCascades + 16,
+              48 + 80 * kMaxShadowCasters + 80 * kMaxLights + 80 * kShadowCascades + 16,
               "The camera data must follow the cascade data");
 static_assert(sizeof(SceneUniformData) ==
-              48 + 80 * kMaxShadowCasters + 64 * kMaxLights + 80 * kShadowCascades + 64,
+              48 + 80 * kMaxShadowCasters + 80 * kMaxLights + 80 * kShadowCascades + 64 + 160
+              + 16 + 4 * 16 * kMaxReflectionProbes + 16 * kSdfLevels + 16 + 16 + 16,
               "SceneUniformData must match the std140 block in mesh.frag");
 
 /**
@@ -222,6 +296,10 @@ public:
     /// (the asset thumbnails). Pass it where a frame index is expected.
     static constexpr uint32_t kPreviewSlot = Renderer::MAX_FRAMES_IN_FLIGHT;
 
+    /// Index of the slot used while a reflection probe photographs the scene.
+    /// Its contents are the frame's, seen from the probe's position.
+    static constexpr uint32_t kProbeSlot = Renderer::MAX_FRAMES_IN_FLIGHT + 1;
+
     /**
      * @brief Copies @p data into the buffer of a frame slot.
      * @param frameIndex Renderer::currentFrameIndex(), or kPreviewSlot.
@@ -243,12 +321,12 @@ private:
     const VulkanContext*  m_ctx    = nullptr;
     VkDescriptorSetLayout m_layout = VK_NULL_HANDLE;
     VkDescriptorPool      m_pool   = VK_NULL_HANDLE;
-    Slot                  m_slots[Renderer::MAX_FRAMES_IN_FLIGHT + 1];   // + kPreviewSlot
+    Slot                  m_slots[Renderer::MAX_FRAMES_IN_FLIGHT + 2];   // + kPreviewSlot, kProbeSlot
 
-    /// Maps a frame index to its slot: the preview slot stays itself, any
-    /// other index wraps around the frames in flight.
+    /// Maps a frame index to its slot: the preview and probe slots stay
+    /// themselves, any other index wraps around the frames in flight.
     static uint32_t slotFor(uint32_t frameIndex) {
-        return frameIndex == kPreviewSlot ? kPreviewSlot
+        return frameIndex >= kPreviewSlot ? std::min(frameIndex, kProbeSlot)
                                           : frameIndex % Renderer::MAX_FRAMES_IN_FLIGHT;
     }
 };

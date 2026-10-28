@@ -51,6 +51,7 @@
 namespace fe {
 
 class ThumbnailRenderer;
+class Scene;
 class ImageThumbnails;
 
 /**
@@ -109,6 +110,15 @@ public:
      * plain icon. The renderer must outlive the browser.
      */
     void setThumbnails(ThumbnailRenderer* thumbnails) { m_thumbnails = thumbnails; }
+
+    /**
+     * @brief Lets the Delete dialog warn about assets the open scene uses.
+     *
+     * Without it the dialog does not check. The scene must outlive the browser.
+     * Deleting is still allowed: the objects just lose their model or texture
+     * (a missing model is drawn as nothing, a missing texture as "none").
+     */
+    void setScene(const Scene* scene) { m_scene = scene; }
 
     /// Source of the pictures shown on image tiles. Optional; without it they show an icon.
     void setImageThumbnails(ImageThumbnails* thumbnails) { m_imageThumbnails = thumbnails; }
@@ -267,6 +277,14 @@ private:
     void moveItems(const std::vector<std::filesystem::path>& sources,
                    const std::filesystem::path& destDir);
 
+    /**
+     * @brief Fills m_deleteUses with the scene objects that use something inside m_deleteTargets.
+     *
+     * Looks at every model, texture slot and the environment of the open
+     * scene. Run once when the Delete dialog is requested, not every frame.
+     */
+    void findDeleteUses();
+
     /// Draws the Rename / New Folder, Delete and Error dialogs.
     void drawDialogs();
 
@@ -341,6 +359,9 @@ private:
     bool                  m_focusNameField   = false;
     std::filesystem::path m_dialogTarget;   ///< Item being renamed; parent for New Folder.
     std::vector<std::filesystem::path> m_deleteTargets;   ///< Items the Delete dialog asks about.
+    const Scene*                       m_scene = nullptr; ///< Scene checked for uses of what is deleted (optional).
+    std::vector<std::string>           m_deleteUses;      ///< "Object (what it uses)" lines for the Delete dialog.
+    size_t                             m_deleteUseCount = 0; ///< Objects using something: may exceed m_deleteUses.size().
     char                  m_nameBuf[256]     = {};
     std::string           m_error;          ///< Text of the Error dialog.
 };

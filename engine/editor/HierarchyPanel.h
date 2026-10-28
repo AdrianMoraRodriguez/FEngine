@@ -36,6 +36,10 @@ private:
     /// and aimed so that it lights the scene's origin, and selects it.
     void createLight(LightComponent::Type type);
 
+    /// Creates a root entity with a ReflectionProbeComponent, a little above
+    /// the origin, and selects it.
+    void createReflectionProbe();
+
     Scene&        m_scene;
     entt::entity& m_selected;
 

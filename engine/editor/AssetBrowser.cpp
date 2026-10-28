@@ -1,6 +1,7 @@
 #include "editor/AssetBrowser.h"
 #include "editor/ImageThumbnails.h"
 
+#include "core/AssetPaths.h"
 #include "core/Log.h"
 #include "core/PathUtil.h"
 #include "core/PlatformShell.h"
@@ -9,6 +10,8 @@
 #include "gfx/ThumbnailRenderer.h"
 #include "import/AssetDatabase.h"
 #include "import/ModelImporter.h"
+#include "scene/Components.h"
+#include "scene/Scene.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>   // TableSetColumnSortDirection: keeps the list's header arrows in step with the View menu
@@ -22,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 
 namespace fe {
 namespace {
@@ -1117,11 +1121,64 @@ void AssetBrowser::applyPendingOp() {
 
         case Op::Delete:
             m_deleteTargets    = std::move(targets);
+            findDeleteUses();
             m_openDeleteDialog = true;
             break;
 
         case Op::None:
             break;
+    }
+}
+
+void AssetBrowser::findDeleteUses() {
+    m_deleteUses.clear();
+    m_deleteUseCount = 0;
+    if (!m_scene) return;
+
+    // Ids of every asset inside what is about to be deleted.
+    std::unordered_set<AssetDatabase::Id> ids;
+    auto addFile = [&ids](const std::filesystem::path& file) {
+        if (!AssetDatabase::isAsset(file)) return;
+        const AssetDatabase::Id id = AssetDatabase::instance().idOf(assets::toRelative(file));
+        if (id != 0) ids.insert(id);
+    };
+    std::error_code ec;
+    for (const auto& target : m_deleteTargets) {
+        if (std::filesystem::is_directory(target, ec)) {
+            for (std::filesystem::recursive_directory_iterator it(target, ec), end; !ec && it != end; it.increment(ec))
+                if (it->is_regular_file(ec)) addFile(it->path());
+        } else {
+            addFile(target);
+        }
+    }
+    if (ids.empty()) return;
+
+    const entt::registry& registry = m_scene->registry();
+    constexpr size_t kMaxLines = 6;
+
+    for (auto [entity, mesh] : registry.view<const MeshRenderer>().each()) {
+        std::string what;
+        auto add = [&what](const char* label) { what += (what.empty() ? "" : ", "); what += label; };
+
+        if (ids.count(mesh.mesh)) add("model");
+        if (const auto* mat = registry.try_get<MaterialComponent>(entity)) {
+            if (ids.count(mat->albedoTexture))     add("albedo");
+            if (ids.count(mat->metalRoughTexture)) add("metal/rough");
+            if (ids.count(mat->normalTexture))     add("normal");
+            if (ids.count(mat->emissiveTexture))   add("emissive");
+        }
+        if (what.empty()) continue;
+
+        ++m_deleteUseCount;
+        if (m_deleteUses.size() < kMaxLines) {
+            const auto* name = registry.try_get<NameComponent>(entity);
+            m_deleteUses.push_back((name ? name->name : std::string("Entity")) + "  (" + what + ")");
+        }
+    }
+
+    if (ids.count(m_scene->settings().environment)) {
+        ++m_deleteUseCount;
+        if (m_deleteUses.size() < kMaxLines) m_deleteUses.push_back("Scene environment");
     }
 }
 
@@ -1392,6 +1449,18 @@ void AssetBrowser::drawDialogs() {
             ImGui::Text("Delete these %zu items?", m_deleteTargets.size());
         if (anyFolder) ImGui::TextUnformatted("Folders and everything inside them will be deleted.");
         ImGui::TextColored(theme::textDim(), "This cannot be undone.");
+
+        // Warn about what the open scene loses. Deleting is still allowed.
+        if (m_deleteUseCount > 0) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
+                               FE_ICON_TRIANGLE_ALERT "  Used by %zu %s in the open scene:",
+                               m_deleteUseCount, m_deleteUseCount == 1 ? "item" : "items");
+            for (const auto& line : m_deleteUses)
+                ImGui::BulletText("%s", line.c_str());
+            if (m_deleteUseCount > m_deleteUses.size())
+                ImGui::TextDisabled("...and %zu more", m_deleteUseCount - m_deleteUses.size());
+        }
         ImGui::Spacing();
 
         ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.70f, 0.25f, 0.25f, 1.0f));
@@ -1417,6 +1486,8 @@ void AssetBrowser::drawDialogs() {
             }
             if (m_clipboard.empty()) m_clipboardCut = false;
             m_deleteTargets.clear();
+            m_deleteUses.clear();
+            m_deleteUseCount = 0;
 
             refresh();
             if (!problems.empty()) fail("Could not delete some items:\n" + problems);

@@ -53,13 +53,70 @@ struct SceneSettings {
     /// Strength of the occlusion: 1 is the plain estimate, more darkens the
     /// occluded parts further, 0 turns the effect off.
     float aoIntensity = 1.5f;
+
+    /// Exposure compensation in stops (EV): 0 leaves the light as it is, +1
+    /// doubles it, -1 halves it. Applied to the whole picture before tone mapping.
+    float exposure = 0.0f;
+
+    /// The curve that brings HDR light into what a screen can show: a
+    /// ToneMapper, stored as its number.
+    int toneMapper = 0;
+
+    /// Whether very bright parts of the picture glow into their surroundings
+    /// (see PostProcess).
+    bool bloom = true;
+
+    /// How strong the glow is. 0 shows none.
+    float bloomIntensity = 0.3f;
+
+    /// Brightness (linear light, 1 = white) from which a pixel starts to glow.
+    /// Lower values make more of the picture glow.
+    float bloomThreshold = 1.0f;
+
+    /// Whether shiny surfaces mirror the rest of the scene on screen, not only the sky
+    /// (screen-space reflections; see ScreenReflections).
+    bool reflections = true;
+
+    /// How strongly the on-screen reflection replaces the sky's where it finds
+    /// something. 0 to 1.
+    float reflectionIntensity = 1.0f;
+
+    /// Farthest a reflection looks for something, in world units.
+    float reflectionDistance = 20.0f;
+
+    /// How thick a surface is assumed to be, in world units: a reflected ray
+    /// passing behind something thinner than this still counts as hitting it.
+    float reflectionThickness = 0.3f;
+
+    /// Shadows traced through the scene's distance field (see GlobalDistanceField),
+    /// which have no distance limit and need no shadow map.
+    /// 0: off. 1: only where the shadow maps do not reach (past the sun's
+    /// cascades, and for lights that cast but got no map). 2: for every
+    /// light that casts, instead of its shadow map.
+    int distanceFieldShadows = 1;
+
+    /// Whether shiny surfaces also mirror what is off screen, traced through the
+    /// scene's distance field (see GlobalDistanceField). Where the screen-space
+    /// reflections find nothing, this one still can. Objects show in their base
+    /// colour, lit by the sun and the sky only.
+    bool distanceFieldReflections = true;
+
+    /// Whether the reflection probes are used (and photographed). Off: they are
+    /// ignored, and the reflections come from the sky, screen-space and the
+    /// distance field alone. Saves the probes' rendering time and memory traffic.
+    bool reflectionProbes = true;
 };
 
 // The WITH_DEFAULT variant fills in any key the file does not have, so a scene
 // file saved before a setting existed still loads.
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SceneSettings, ambientColor, ambientIntensity,
                                                 environment, environmentIntensity, showSky,
-                                                ambientOcclusion, aoRadius, aoIntensity)
+                                                ambientOcclusion, aoRadius, aoIntensity,
+                                                exposure, toneMapper, bloom, bloomIntensity,
+                                                bloomThreshold, reflections, reflectionIntensity,
+                                                reflectionDistance, reflectionThickness,
+                                                distanceFieldShadows, distanceFieldReflections,
+                                                reflectionProbes)
 
 /**
  * @brief A scene: a collection of entities with components.

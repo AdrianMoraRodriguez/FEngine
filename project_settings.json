@@ -1,0 +1,9 @@
+{
+    "distanceFieldDetail": 2,
+    "distanceFieldReflectedShadows": true,
+    "distanceFieldReflectionQuality": 2,
+    "distanceFieldReflectionReach": 0,
+    "distanceFieldResolution": 2,
+    "distanceFieldShadowBias": 1.0,
+    "meshFieldResolution": 3
+}

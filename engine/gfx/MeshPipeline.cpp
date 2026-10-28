@@ -69,6 +69,9 @@ bool MeshPipeline::init(const VulkanContext& ctx,
                         VkDescriptorSetLayout materialLayout,
                         VkDescriptorSetLayout environmentLayout,
                         VkDescriptorSetLayout occlusionLayout,
+                        VkDescriptorSetLayout reflectionLayout,
+                        VkDescriptorSetLayout probeLayout,
+                        VkDescriptorSetLayout fieldLayout,
                         bool translucent) {
     m_ctx = &ctx;
 
@@ -183,7 +186,7 @@ bool MeshPipeline::init(const VulkanContext& ctx,
     dynamicState.dynamicStateCount = 3;
     dynamicState.pDynamicStates    = dynamicStates;
 
-    // ---- Pipeline layout: set 0 (scene data), set 1 (material), set 2 (environment), set 3 (occlusion) + push constants ----
+    // ---- Pipeline layout: set 0 (scene data), set 1 (material), set 2 (environment), set 3 (occlusion), set 4 (reflections) + push constants ----
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushRange.offset     = 0;
@@ -191,8 +194,8 @@ bool MeshPipeline::init(const VulkanContext& ctx,
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    const VkDescriptorSetLayout setLayouts[] = {sceneLayout, materialLayout, environmentLayout, occlusionLayout};
-    layoutInfo.setLayoutCount         = 4;
+    const VkDescriptorSetLayout setLayouts[] = {sceneLayout, materialLayout, environmentLayout, occlusionLayout, reflectionLayout, probeLayout, fieldLayout};
+    layoutInfo.setLayoutCount         = 7;
     layoutInfo.pSetLayouts            = setLayouts;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges    = &pushRange;
@@ -289,6 +292,27 @@ void MeshPipeline::bindOcclusion(VkCommandBuffer cmd, VkDescriptorSet occlusionS
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
                             3,               // first set number: set 3
                             1, &occlusionSet,
+                            0, nullptr);
+}
+
+void MeshPipeline::bindReflections(VkCommandBuffer cmd, VkDescriptorSet reflectionSet) const {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
+                            4,               // first set number: set 4
+                            1, &reflectionSet,
+                            0, nullptr);
+}
+
+void MeshPipeline::bindProbes(VkCommandBuffer cmd, VkDescriptorSet probeSet) const {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
+                            5,               // first set number: set 5
+                            1, &probeSet,
+                            0, nullptr);
+}
+
+void MeshPipeline::bindDistanceField(VkCommandBuffer cmd, VkDescriptorSet fieldSet) const {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout,
+                            6,               // first set number: set 6
+                            1, &fieldSet,
                             0, nullptr);
 }
 

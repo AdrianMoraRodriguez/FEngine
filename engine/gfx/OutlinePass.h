@@ -8,7 +8,7 @@
  * on screen, not of its surface:
  *   1. The selected objects are drawn into a small single-channel image, the
  *      mask, as 1 where they cover a pixel and 0 elsewhere.
- *   2. A full-screen pass over the scene colour looks around every pixel of
+ *   2. A full-screen pass over the finished picture looks around every pixel of
  *      the mask. Any pixel that is not covered but has a covered pixel within
  *      a few pixels of it gets the outline colour.
  *
@@ -40,9 +40,12 @@ struct OutlineMaskPushConstants {
  *     mesh.draw(cmd);
  * outline.endMask(cmd);
  *
- * // ... scene pass ...
- * outline.draw(cmd, extent);                // inside it, after the scene
+ * // ... scene pass, then the post-processing pass ...
+ * outline.draw(cmd, extent);                // inside the latter, after the picture is written
  * @endcode
+ * It is drawn over the finished, display-ready image (see PostProcess), so
+ * exposure and tone mapping do not change its colour. That pass has one
+ * sample per pixel and no depth.
  * The mask follows the size of the scene render target: beginMask() makes a
  * new one whenever @p extent changes.
  */
@@ -56,14 +59,11 @@ public:
 
     /**
      * @param ctx         Initialised Vulkan context.
-     * @param colorFormat Format of the scene colour target the outline is drawn on.
-     * @param depthFormat Format of that pass's depth target (the pass has one,
-     *                    even though the outline does not use it).
+     * @param colorFormat Format of the finished image the outline is drawn on.
      * @param shaderDir   Directory containing the compiled SPIR-V shaders.
      * @return `true` on success.
      */
-    bool init(const VulkanContext& ctx, VkFormat colorFormat, VkFormat depthFormat,
-              const char* shaderDir);
+    bool init(const VulkanContext& ctx, VkFormat colorFormat, const char* shaderDir);
 
     /// Destroys everything. Safe to call more than once.
     void shutdown();
@@ -94,7 +94,7 @@ private:
     void destroyMask();
     VkShaderModule loadShader(const char* path) const;
     bool createMaskPipeline(const char* shaderDir);
-    bool createOutlinePipeline(VkFormat colorFormat, VkFormat depthFormat, const char* shaderDir);
+    bool createOutlinePipeline(VkFormat colorFormat, const char* shaderDir);
 
     const VulkanContext* m_ctx = nullptr;
 

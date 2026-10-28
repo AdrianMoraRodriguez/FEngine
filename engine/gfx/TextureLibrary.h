@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace fe {
 
@@ -57,7 +58,18 @@ class VulkanContext;
  *     "pop in" together. An image that cannot be loaded is replaced by the
  *     neutral one; the reason is logged once.
  *
- * Nothing is evicted yet: textures and materials live until shutdown().
+ * ### How they leave
+ * A texture or material nobody has asked for during the last kIdleFrames
+ * frames is idle. When the library is getting full (more than three quarters
+ * of kMaxTextures or kMaxMaterials) or has just had to refuse a request for
+ * lack of room, update() frees every idle material and, once no material uses
+ * it, every idle texture. A freed one that is needed again is simply loaded
+ * again (and pops in like the first time).
+ *
+ * That is safe without waiting for the GPU because the renderer asks for the
+ * material of everything it draws, on every frame it draws it: something idle
+ * for kIdleFrames frames cannot be in any frame still in flight, and no set is
+ * kept from one frame to the next.
  */
 class TextureLibrary {
 public:
@@ -66,6 +78,10 @@ public:
 
     /// Most distinct materials (descriptor sets) that can be alive at once.
     static constexpr uint32_t kMaxMaterials = 1024;
+
+    /// Frames without a request after which a texture or material may be freed.
+    /// Many times the number of frames the GPU keeps in flight.
+    static constexpr uint64_t kIdleFrames = 120;
 
     /// The texture slots of a material (the bindings of set 1).
     enum Slot : int { Albedo = 0, MetalRough = 1, Normal = 2, Emissive = 3, SlotCount = 4 };
@@ -151,6 +167,9 @@ public:
     /// @return The number of textures loaded or loading (the limit is kMaxTextures).
     uint32_t textureCount() const { return m_textureCount; }
 
+    /// @return The number of materials alive, not counting the default one (the limit is kMaxMaterials).
+    uint32_t materialCount() const { return static_cast<uint32_t>(m_materials.size()); }
+
     /// @return A key for image number @p image of the model @p model. It never
     ///         equals an asset id (those have the top bit set; this does not).
     static uint64_t modelTextureKey(uint64_t model, uint32_t image);
@@ -162,6 +181,7 @@ private:
         State                                 state = State::Loading;
         std::future<std::optional<ImageData>> decoding;   ///< Valid while Loading.
         Texture                               texture;    ///< Valid when Ready.
+        uint64_t                              lastUsed = 0;   ///< Frame of the last request that looked it up.
     };
 
     using EntryMap = std::unordered_map<uint64_t, Entry>;
@@ -195,9 +215,21 @@ private:
     ///         first time. `nullptr` if there is no room for another texture.
     Entry* entryFor(int slot, const TextureRef& ref);
 
+    /// A built material: its set, which block of the uniform buffer it owns,
+    /// and when it was last asked for.
+    struct MaterialInfo {
+        VkDescriptorSet set       = VK_NULL_HANDLE;
+        uint32_t        block     = 0;
+        uint64_t        lastUsed  = 0;
+    };
+
     /// Allocates a set for @p request, once all its images are settled.
-    VkDescriptorSet createMaterialSet(const MaterialRequest& request,
-                                      const std::array<const Texture*, SlotCount>& ready);
+    /// @return The set and its block, or a null set if there is no room left.
+    MaterialInfo createMaterialSet(const MaterialRequest& request,
+                                   const std::array<const Texture*, SlotCount>& ready);
+
+    /// Frees the idle materials and then the idle textures nothing uses.
+    void evictIdle();
 
     const VulkanContext* m_ctx = nullptr;
 
@@ -213,16 +245,19 @@ private:
     uint8_t*      m_blockMapped     = nullptr;
 
     VkDescriptorSet m_defaultSet = VK_NULL_HANDLE;
-    uint32_t        m_materialCount = 0;
+    uint32_t        m_nextBlock     = 1;   ///< First block never handed out (0 is the default material's).
+    std::vector<uint32_t> m_freeBlocks;    ///< Blocks of freed materials, ready to be reused.
     uint32_t        m_textureCount  = 0;
+    uint64_t        m_frame         = 0;   ///< Counts update() calls.
+    uint64_t        m_nextEvictFrame = 0;  ///< No eviction pass before this frame.
+    bool            m_pressure      = false;   ///< A request was refused for lack of room.
     uint64_t        m_waitingRequests = 0;
     bool            m_warnedTextures  = false;
-    bool            m_warnedMaterials = false;
 
     EntryMap m_colorTextures;    ///< Uploaded as sRGB.
     EntryMap m_dataTextures;     ///< Uploaded as linear.
 
-    std::unordered_map<MaterialKey, VkDescriptorSet, MaterialKeyHash> m_materials;
+    std::unordered_map<MaterialKey, MaterialInfo, MaterialKeyHash> m_materials;
 };
 
 } // namespace fe

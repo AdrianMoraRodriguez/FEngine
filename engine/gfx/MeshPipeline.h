@@ -13,7 +13,10 @@
  *   - descriptor set 1, bound per object (its material's textures; see
  *     TextureLibrary), and
  *   - descriptor set 2, the environment (the sky's light; see Environment), and
- *   - descriptor set 3, the ambient occlusion (see AmbientOcclusion).
+ *   - descriptor set 3, the ambient occlusion (see AmbientOcclusion), and
+ *   - descriptor set 4, what screen-space reflections read (see ScreenReflections), and
+ *   - descriptor set 5, the reflection probes' cube maps (see ReflectionProbes).
+ *   - descriptor set 6, the scene's global distance field (see GlobalDistanceField).
  *
  * Uses dynamic rendering: no VkRenderPass is needed.
  */
@@ -69,6 +72,9 @@ public:
      * @param materialLayout    Layout of set 1 (TextureLibrary::layout()).
      * @param environmentLayout Layout of set 2 (Environment::createLayout()).
      * @param occlusionLayout   Layout of set 3 (AmbientOcclusion::resultLayout()).
+     * @param reflectionLayout  Layout of set 4 (ScreenReflections::layout()).
+     * @param probeLayout       Layout of set 5 (ReflectionProbes::layout()).
+     * @param fieldLayout       Layout of set 6 (GlobalDistanceField::sampleLayout()).
      * @param translucent       `true` builds the variant for translucent materials:
      *                          its output is mixed with what is behind it and it
      *                          does not write depth, so it must be drawn after
@@ -83,6 +89,9 @@ public:
               VkDescriptorSetLayout materialLayout,
               VkDescriptorSetLayout environmentLayout,
               VkDescriptorSetLayout occlusionLayout,
+              VkDescriptorSetLayout reflectionLayout,
+              VkDescriptorSetLayout probeLayout,
+              VkDescriptorSetLayout fieldLayout,
               bool translucent = false);
 
     /// Destroys all Vulkan objects.
@@ -132,6 +141,30 @@ public:
      * Call once per pass, before the first draw call.
      */
     void bindOcclusion(VkCommandBuffer cmd, VkDescriptorSet occlusionSet) const;
+
+    /**
+     * @brief Binds the descriptor set with the scene depth and the previous
+     *        frame's colour that screen-space reflections read (set 4).
+     *
+     * Call once per pass, before the first draw call.
+     */
+    void bindReflections(VkCommandBuffer cmd, VkDescriptorSet reflectionSet) const;
+
+    /**
+     * @brief Binds the descriptor set with the reflection probes' cube maps (set 5).
+     *
+     * Call once per pass, before the first draw call. Which probes apply is
+     * decided by the scene data (set 0), so the set can always be bound.
+     */
+    void bindProbes(VkCommandBuffer cmd, VkDescriptorSet probeSet) const;
+
+    /**
+     * @brief Binds the descriptor set with the scene's global distance field (set 6).
+     *
+     * Call once per pass, before the first draw call. Whether the shader traces
+     * it is decided by the scene data (set 0), so the set can always be bound.
+     */
+    void bindDistanceField(VkCommandBuffer cmd, VkDescriptorSet fieldSet) const;
 
     /**
      * @brief Uploads the per-object push constants.

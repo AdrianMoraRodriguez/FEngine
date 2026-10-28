@@ -33,8 +33,10 @@ layout(location = 0) out vec4 outColor;
 
 const int MAX_LIGHTS         = 16;   // must equal kMaxLights in SceneUniforms.h
 const int MAX_SHADOW_CASTERS = 4;    // must equal kMaxShadowCasters in SceneUniforms.h
+const int MAX_PROBES         = 8;    // must equal kMaxReflectionProbes in SceneUniforms.h
 const int MAX_POINT_SHADOW_CASTERS = 2;   // must equal kMaxPointShadowCasters in SceneUniforms.h
 const int SHADOW_CASCADES = 4;       // must equal kShadowCascades in SceneUniforms.h
+const int SDF_LEVELS = 3;            // must equal kSdfLevels in SceneUniforms.h
 
 /// Fraction of a cascade's far distance, at its end, over which it blends into
 /// the next cascade. Must equal kCascadeBlend in SceneRenderer.cpp, which
@@ -51,6 +53,7 @@ struct Light {
     vec4 colorType;       ///< rgb: colour * intensity. w: type (LIGHT_*).
     vec4 direction;       ///< xyz: direction the light travels. w: size of the light (radius in world units; for a directional light, the tangent of its angular radius).
     vec4 spotCone;        ///< x: cos of the spot's outer half-angle. y: cos of the inner one. z: shadow map slot, or -1. w: 1 if cascaded.
+    vec4 extra;           ///< x: 1 if the light casts shadows (with a map or not).
 };
 
 /// Scene-wide data, filled by the CPU once per frame (see SceneUniformData in
@@ -69,6 +72,19 @@ layout(set = 0, binding = 0, std140) uniform SceneData {
     vec4  cameraForward;                       ///< xyz: view direction. w: dot(xyz, p) + w is p's depth in front of the camera.
     vec4  cameraPosition;                      ///< w = 1: xyz is the camera's position. w = 0: xyz is the unit vector towards a camera infinitely far away (previews).
     vec4  environmentParams;                   ///< x: brightness of the environment light (0 = none).
+    mat4  viewProj;                            ///< World space -> clip space of this frame's camera.
+    mat4  prevViewProj;                        ///< Same, for the camera of the picture the reflections read.
+    vec4  ssrParams;                           ///< x: strength (0 = off). y: farthest ray. z: thickness. w: highest mip of the picture.
+    vec4  ssrProj;                             ///< x: projection[2][2]. y: projection[3][2].
+    ivec4 probeCount;                          ///< x: number of reflection probes in use.
+    vec4  probeBoxMin[MAX_PROBES];             ///< xyz: low corner of the probe's box. w: its intensity.
+    vec4  probeBoxMax[MAX_PROBES];             ///< xyz: high corner. w: width of the soft border.
+    vec4  probePosition[MAX_PROBES];           ///< xyz: where the probe photographed from. w: 1 = correct for the box.
+    vec4  probeLayer[MAX_PROBES];              ///< x: the probe's layer in probeCubes.
+    vec4  sdfOrigin[SDF_LEVELS];               ///< Distance field levels. xyz: low corner. w: cell size.
+    vec4  sdfParams;                           ///< x: which lights trace it (0 none, 1 beyond the maps, 2 all). y: cells per side. z: farthest ray. w: 1 if reflections use it.
+    vec4  sdfQuality;                          ///< Reflections through the field. x: most steps. y: cell size of the finest level. z: 1 to also trust the second level. w: how many objects the field holds.
+    vec4  sdfTuning;                           ///< x: how far above a surface a shadow ray starts, in cells. y: 1 if reflected surfaces are shadowed.
 } scene;
 
 /// The environment (set 2): the sky as the objects see it. Mirrors Environment.h.
@@ -89,6 +105,47 @@ layout(set = 2, binding = 1, std140) uniform EnvironmentData {
 /// and under objects. It has the size of the render target and is read at the
 /// pixel's own position; a 1 x 1 white image stands in when there is none.
 layout(set = 3, binding = 0) uniform sampler2D ambientOcclusionMap;
+
+/// What screen-space reflections look through (set 4; see ScreenReflections).
+/// ssrDepth: the depth of everything visible, as the camera sees it (1 = nothing).
+/// ssrHistory: the previous frame's picture (linear HDR), blurrier in each mip level.
+/// With nothing to reflect the depth is 1 everywhere, so no ray ever hits.
+layout(set = 4, binding = 0) uniform sampler2D ssrDepth;
+layout(set = 4, binding = 1) uniform sampler2D ssrHistory;
+
+/// The reflection probes (set 5): what the scene looks like from each probe's
+/// position, as one cube map per probe, each blurrier in every mip level the way
+/// a rougher surface would blur it. The probe's index is scene.probeLayer[i].x.
+/// Indexed with constants only (see probeColour), like the shadow maps.
+/// Which probes apply, and where, is in the scene data (probeCount and friends).
+layout(set = 5, binding = 0) uniform samplerCube probeCubes[MAX_PROBES];
+
+/// The scene's global distance field (set 6; see GlobalDistanceField): for every
+/// point near the camera, how far the nearest surface is (negative inside). Three
+/// levels of cubes with growing cells are stacked along z: level l is layers
+/// l * n .. (l + 1) * n - 1. Only read when scene.sdfParams.x is not 0.
+layout(set = 6, binding = 0) uniform sampler3D distanceField;
+
+/// The colour (linear) of the nearest object at every cell of the field, stacked the same way.
+layout(set = 6, binding = 1) uniform sampler3D distanceColour;
+
+/// The fields of the individual meshes, stacked along z (see SdfAtlas). Where a
+/// reflection ray hits the global field, these give the shape back with the
+/// detail of the mesh instead of the cells of the field.
+layout(set = 6, binding = 2) uniform sampler3D meshAtlas;
+
+/// One object of the scene, as the global field is built from (SdfInstance in
+/// GlobalDistanceField.h). scene.sdfQuality.w of them are valid.
+struct FieldInstance {
+    mat4 worldToLocal;   ///< World space -> the mesh's own space.
+    vec4 boxMin;         ///< xyz: corner of the mesh's field, in the mesh's space. w: how metallic the object is.
+    vec4 boxMax;         ///< xyz: opposite corner. w: size of a cell of the mesh's field.
+    vec4 atlasInfo;      ///< x: where the brick starts along z. yzw: cells of the field.
+    vec4 extra;          ///< x: smallest scale of the transform. yzw: the object's colour (linear).
+};
+layout(std430, set = 6, binding = 3) readonly buffer FieldInstances {
+    FieldInstance fieldInstances[];
+};
 
 /// Depth of the scene as seen from each shadow-casting light. *Shadow*
 /// samplers: texture() takes a reference depth and returns 1 where the stored
@@ -328,14 +385,93 @@ float shadowFactor(int slot, int cascade, vec3 worldPos, vec3 normal, vec3 toLig
     return lit / float(SHADOW_SAMPLES);
 }
 
+/// Samples the global distance field at a world position.
+/// @return x: signed distance to the nearest surface. y: the size of the cells of
+///         the level that answered, or 0 if the point is outside every level.
+/// The finest level that holds the point with a margin of four cells answers; the
+/// margin keeps the trilinear lookup away from the level's edge and from the
+/// neighbouring level stacked beside it.
+vec2 distanceFieldSample(vec3 p) {
+    float n = scene.sdfParams.y;
+    float margin = 4.0 / n;
+    for (int l = 0; l < SDF_LEVELS; ++l) {
+        vec4 level = scene.sdfOrigin[l];
+        vec3 u = (p - level.xyz) / (level.w * n);
+        if (all(greaterThan(u, vec3(margin))) && all(lessThan(u, vec3(1.0 - margin)))) {
+            vec3 uv = vec3(u.xy, (float(l) + u.z) / float(SDF_LEVELS));
+            return vec2(textureLod(distanceField, uv, 0.0).r, level.w);
+        }
+    }
+    return vec2(0.0);
+}
+
+/// Most steps of a shadow ray. A ray that has not reached the light (or left the
+/// field) by then is taken as lit.
+const int SDF_SHADOW_STEPS = 64;
+
+/// Shadow of a light, traced through the distance field.
+///
+/// A ray goes from the surface towards the light. At each step the field says
+/// how far the nearest surface is, which is how far the ray can safely go; and
+/// how close it passed to that surface along the way says how much of the light
+/// it covers. A light is not a point: seen from the surface it is a disc, and a
+/// blocker at distance t covers part of it when it is nearer the ray than the
+/// disc's radius there (size * t for the sun, size * t / lightDistance for a
+/// lamp). The visibility is 0.5 for a ray that grazes the blocker, 1 when it
+/// clears it by that radius and 0 when it is inside by as much.
+///
+/// The field is built with every surface inflated by half a cell, and its
+/// cells are big, so the ray starts a cell above the surface (along the normal)
+/// instead of on it, or the surface would shadow itself. That is also why
+/// contact shadows are lost: use the shadow maps where those matter.
+///
+/// @param size          Light size, as in GpuLight::direction.w.
+/// @param lightDistance Distance to the light, or 0 for a directional light.
+/// @param range         Farthest the ray goes (the light's range, or the field's reach).
+float distanceFieldShadow(vec3 worldPos, vec3 normal, vec3 toLight,
+                          float size, float lightDistance, float range) {
+    vec2 start = distanceFieldSample(worldPos);
+    if (start.y == 0.0) return 1.0;   // outside the field: nothing known, nothing shadowed
+
+    float cell   = start.y;
+    vec3  origin = worldPos + normal * (cell * scene.sdfTuning.x);
+    float tMax   = (lightDistance > 0.0) ? min(lightDistance, range) : range;
+
+    float visibility = 1.0;
+    float t = 0.0;
+    for (int i = 0; i < SDF_SHADOW_STEPS; ++i) {
+        vec2 s = distanceFieldSample(origin + toLight * t);
+        if (s.y == 0.0) break;   // left the field: the rest is not known, assume open
+
+        float radius = (lightDistance > 0.0) ? size * t / lightDistance : size * t;
+        radius = max(radius, 0.35 * s.y);   // never sharper than the field itself
+
+        visibility = min(visibility, clamp(0.5 + 0.5 * s.x / radius, 0.0, 1.0));
+        if (visibility < 0.01) return 0.0;
+
+        // A step shorter than the safe distance: the field is interpolated from
+        // coarse cells, and near a sharp corner it can overstate the distance.
+        t += max(0.65 * s.x, 0.25 * s.y);
+        if (t >= tMax) break;
+    }
+    return visibility;
+}
+
+/// What the distance field says about the sun where the cascades end, or full
+/// light when the distance field shadows are off.
+float beyondCascadesShadow(vec3 worldPos, vec3 normal, vec3 toLight, float size) {
+    if (scene.sdfParams.x < 0.5) return 1.0;
+    return distanceFieldShadow(worldPos, normal, toLight, size, 0.0, scene.sdfParams.z);
+}
+
 /// Like shadowFactor(), for the sun's cascaded shadow. The cascade is chosen
 /// by how far the point is in front of the camera. Near the end of a cascade
 /// the next one is blended in, so no seam shows where they meet, and past the
-/// last cascade the shadow fades out to full light.
+/// last cascade the shadow fades into the distance field's (full light if it is off).
 float cascadedShadowFactor(vec3 worldPos, vec3 normal, vec3 toLight, float size) {
     float depth  = dot(scene.cameraForward.xyz, worldPos) + scene.cameraForward.w;
     vec4  splits = scene.cascadeSplits;
-    if (depth >= splits.w) return 1.0;
+    if (depth >= splits.w) return beyondCascadesShadow(worldPos, normal, toLight, size);
 
     int cascade = 0;
     if (depth > splits.x) cascade = 1;
@@ -350,7 +486,7 @@ float cascadedShadowFactor(vec3 worldPos, vec3 normal, vec3 toLight, float size)
     if (blend > 0.0) {
         float next = (cascade < SHADOW_CASCADES - 1)
                    ? shadowFactor(0, cascade + 1, worldPos, normal, toLight, 0.0, size)
-                   : 1.0;
+                   : beyondCascadesShadow(worldPos, normal, toLight, size);
         lit = mix(lit, next, blend);
     }
     return lit;
@@ -441,45 +577,11 @@ float distanceFalloff(float distance, float range) {
     return window * window / (distance * distance + 1.0);
 }
 
-/// Compresses any brightness, however large, into the 0..1 range a screen can
-/// show. This is the "PBR Neutral" curve of the Khronos Group: colours below
-/// the shoulder (about 0.76) pass through unchanged, and above it the
-/// brightness is rolled off smoothly while the hue is kept. A filmic curve such
-/// as ACES works on each channel separately and so pushes a saturated bright
-/// colour towards white (a strong red light turns pink); this one does not,
-/// which keeps coloured lights and coloured textures looking like themselves.
-/// sky.frag has the same function: the sky and the objects must match.
-vec3 toneMapNeutral(vec3 color) {
-    const float startCompression = 0.8 - 0.04;
-    const float desaturation     = 0.15;
-
-    float x = min(color.r, min(color.g, color.b));
-    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
-    color -= offset;
-
-    float peak = max(color.r, max(color.g, color.b));
-    if (peak < startCompression) return color;
-
-    float d = 1.0 - startCompression;
-    float newPeak = 1.0 - d * d / (peak + d - startCompression);
-    color *= newPeak / peak;
-
-    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
-    return mix(color, newPeak * vec3(1.0), g);
-}
-
 /// Converts a colour as shown on a screen (sRGB, what an artist picks) into
 /// the linear amounts of light that lighting maths needs. Uses the simple
 /// power-2.2 approximation of the exact sRGB curve.
 vec3 srgbToLinear(vec3 c) {
     return pow(c, vec3(2.2));
-}
-
-/// Converts linear light into the encoding a screen expects. Without this
-/// the display applies its own curve to values that never had one, and
-/// every mid-tone comes out too dark. Inverse of srgbToLinear().
-vec3 linearToSrgb(vec3 c) {
-    return pow(c, vec3(1.0 / 2.2));
 }
 
 const float PI = 3.14159265359;
@@ -593,6 +695,379 @@ vec3 environmentSpecular(vec3 r, float roughness) {
     return textureLod(environmentMap, r, roughness * lastLevel).rgb;
 }
 
+
+/// Distance in front of the camera of the point a depth value stands for.
+/// (Vulkan depth range; the projection keeps its two depth numbers in ssrProj.)
+float ssrLinearDistance(float depth) {
+    return scene.ssrProj.y / (depth + scene.ssrProj.x);
+}
+
+/// How far behind the nearest surface at screen position `uv` the point `p` lies
+/// (positive: behind it, so the ray has gone through), or -1 if `p` is off the
+/// screen. `uv` receives its screen position.
+float ssrBehind(vec3 p, out vec2 uv, out bool onScreen) {
+    vec4 clip = scene.viewProj * vec4(p, 1.0);
+    onScreen = clip.w > 0.0;
+    uv = clip.xy / max(clip.w, 1e-6) * 0.5 + 0.5;
+    onScreen = onScreen && all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+    if (!onScreen) return -1.0;
+    return clip.w - ssrLinearDistance(textureLod(ssrDepth, uv, 0.0).r);
+}
+
+/// What a ray from `origin` along `dir` finds on screen.
+/// rgb: the colour of the surface it hits, as it looked in the previous picture.
+/// a: how much to trust it (0: no hit, or too near the edge of what is known).
+///
+/// The ray is walked in world space, in steps that start short and grow
+/// (precision near the surface, reach far away). When a step ends behind the
+/// visible surface, the crossing is narrowed down by halving, and kept if the
+/// ray did not go behind something much farther away (a thin pillar in front of
+/// a wall is not a hit for a ray passing behind it).
+///
+/// The steps are the same for every pixel, not shifted at random: without a
+/// temporal filter to average it away, random shifts show up as noise along the
+/// edges of reflected objects, while fixed ones give clean edges.
+vec4 screenSpaceReflection(vec3 origin, vec3 dir, float roughness) {
+    const int STEPS  = 32;
+    const int REFINE = 5;
+
+    float maxDistance = scene.ssrParams.y;
+    float thickness   = scene.ssrParams.z;
+
+    float previousT = 0.0;
+    for (int i = 0; i < STEPS; ++i) {
+        float f = float(i + 1) / float(STEPS);
+        float t = maxDistance * f * f + 1e-3;
+
+        vec2 uv; bool onScreen;
+        float behind = ssrBehind(origin + dir * t, uv, onScreen);
+        if (!onScreen) break;          // left the screen: nothing known past here
+
+        if (behind > 0.0 && behind < thickness + (t - previousT)) {
+            // Between previousT (in front) and t (behind): find the crossing.
+            float lo = previousT, hi = t;
+            for (int k = 0; k < REFINE; ++k) {
+                float mid = 0.5 * (lo + hi);
+                vec2 midUv; bool midOn;
+                if (ssrBehind(origin + dir * mid, midUv, midOn) > 0.0) hi = mid; else lo = mid;
+            }
+            vec3 hit = origin + dir * hi;
+
+            // A real surface is crossed smoothly: after the halving the ray is
+            // right at it. At the edge of an object the depth jumps instead, the
+            // halving ends next to the edge, and the ray is still far behind the
+            // nearest surface: it went behind the object, not into it. That
+            // would paint the object's colour smeared over what it hides (and,
+            // with the fixed steps, as a saw-toothed edge), so the more the ray
+            // is still behind, the less the hit is trusted.
+            vec2 hitUv; bool hitOn;
+            float gap = ssrBehind(hit, hitUv, hitOn);
+
+            // Where that point was in the previous picture.
+            vec4 prev = scene.prevViewProj * vec4(hit, 1.0);
+            if (prev.w <= 0.0) return vec4(0.0);
+            vec2 prevUv = prev.xy / prev.w * 0.5 + 0.5;
+
+            // Near the borders of the picture the reflected surface may be only half
+            // there, and a ray that left the picture would have found nothing at all:
+            // the more so the closer the hit is to a border, the less it is trusted, over
+            // a wide band so that the change to the probe or the sky is not a line.
+            vec2 edge = smoothstep(vec2(0.0), vec2(0.2), prevUv) * (1.0 - smoothstep(vec2(0.8), vec2(1.0), prevUv));
+            float trust = edge.x * edge.y;
+            trust *= 1.0 - smoothstep(0.15 * thickness, 0.6 * thickness, gap);   // went behind an edge
+
+            // A surface seen almost edge-on (depth changing fast from pixel to pixel)
+            // is only a few pixels wide in the previous picture; reflected, it is
+            // stretched and shows the staircase of its own edge. Rather than that,
+            // the probe or the sky is let through, more so the more edge-on it is.
+            vec2  texel = 1.0 / vec2(textureSize(ssrDepth, 0));
+            float d0    = ssrLinearDistance(textureLod(ssrDepth, hitUv, 0.0).r);
+            float dx    = ssrLinearDistance(textureLod(ssrDepth, hitUv + vec2(texel.x, 0.0), 0.0).r);
+            float dy    = ssrLinearDistance(textureLod(ssrDepth, hitUv + vec2(0.0, texel.y), 0.0).r);
+            float slope = max(abs(dx - d0), abs(dy - d0)) / max(d0, 1e-3);   // depth change per pixel, relative
+            trust *= 1.0 - smoothstep(0.02, 0.08, slope);
+            trust *= 1.0 - smoothstep(0.6, 1.0, hi / maxDistance);       // far hits fade out
+            trust *= 1.0 - smoothstep(0.25, 0.6, roughness);             // rough surfaces blur it away
+
+            vec3 colour = textureLod(ssrHistory, prevUv, min(roughness * 1.6, 1.0) * scene.ssrParams.w).rgb;
+            return vec4(min(colour, vec3(24.0)), trust);                 // a lone bright pixel must not flare
+        }
+        previousT = t;
+    }
+    return vec4(0.0);
+}
+
+/// The colour (rgb) and metalness (a) of the object nearest to `p`, from the distance field's colour volume.
+vec4 distanceFieldColour(vec3 p) {
+    float n = scene.sdfParams.y;
+    float margin = 4.0 / n;
+    for (int l = 0; l < SDF_LEVELS; ++l) {
+        vec4 level = scene.sdfOrigin[l];
+        vec3 u = (p - level.xyz) / (level.w * n);
+        if (all(greaterThan(u, vec3(margin))) && all(lessThan(u, vec3(1.0 - margin))))
+            return textureLod(distanceColour, vec3(u.xy, (float(l) + u.z) / float(SDF_LEVELS)), 0.0);
+    }
+    return vec4(0.5, 0.5, 0.5, 0.0);
+}
+
+/// Most steps a reflection ray can take whatever the setting says (the loop needs a constant bound).
+const int SDF_REFLECTION_STEPS = 128;
+
+/// Distance, in metres, from the world point `p` to the mesh of object `index`.
+/// Exact up to the resolution of the mesh's own field; positive outside.
+float meshFieldDistance(int index, vec3 p) {
+    FieldInstance inst = fieldInstances[index];
+    vec3  local = (inst.worldToLocal * vec4(p, 1.0)).xyz;
+    float voxel = inst.boxMax.w;
+
+    // Position in cells of the field, where cell i has its centre at i + 0.5.
+    vec3  g       = (local - inst.boxMin.xyz) / voxel;
+    vec3  dims    = inst.atlasInfo.yzw;
+    vec3  clamped = clamp(g, vec3(0.5), dims - 0.5);
+    float outside = length(g - clamped) * voxel;
+
+    vec3 uv = vec3(clamped.xy, inst.atlasInfo.x + clamped.z) / vec3(textureSize(meshAtlas, 0));
+    return (textureLod(meshAtlas, uv, 0.0).r + outside) * inst.extra.x;
+}
+
+/// Lower bound of the distance from `p` to the object's mesh: the distance to
+/// the box of its field. Cheap, and lets most objects be skipped.
+float meshBoxDistance(int index, vec3 p) {
+    FieldInstance inst = fieldInstances[index];
+    vec3 local    = (inst.worldToLocal * vec4(p, 1.0)).xyz;
+    vec3 centre   = 0.5 * (inst.boxMin.xyz + inst.boxMax.xyz);
+    vec3 halfSize = 0.5 * (inst.boxMax.xyz - inst.boxMin.xyz);
+    return length(max(abs(local - centre) - halfSize, vec3(0.0))) * inst.extra.x;
+}
+
+/// Follows the ray again, now against the individual meshes near a hit found in
+/// the global field. The field's cells are coarse (and its surfaces inflated);
+/// the meshes' own fields are much finer, so the hit moves onto the real surface
+/// and the normal and colour come from it.
+///
+/// @param from     Where the ray started.
+/// @param t        In: distance of the hit in the global field. Out: of the refined hit.
+/// @param cell     Size of the global field's cells at the hit.
+/// @param normal   Out: the surface's direction, facing the ray.
+/// @param surface  Out: rgb the object's colour, a how metallic it is.
+/// @return true if a mesh was hit; false leaves everything as it was.
+bool refineHitWithMeshes(vec3 from, vec3 dir, float roughness, float cell,
+                         inout float t, out vec3 normal, out vec4 surface) {
+    normal  = vec3(0.0);
+    surface = vec4(0.0);
+
+    int total = int(scene.sdfQuality.w);
+    if (total <= 0) return false;
+
+    // The objects close to the hit: those whose mesh is within a few cells.
+    // The few that are kept are the only ones followed afterwards.
+    vec3 hitPoint = from + dir * t;
+    int  near[4];
+    int  nearCount = 0;
+    float reach = 3.0 * cell;
+    for (int i = 0; i < total && nearCount < 4; ++i) {
+        if (meshBoxDistance(i, hitPoint) > reach) continue;
+        if (meshFieldDistance(i, hitPoint) > reach) continue;
+        near[nearCount++] = i;
+    }
+    if (nearCount == 0) return false;
+
+    // Start a little before the coarse hit, which lies at most about a cell
+    // and a half off the true surface, and follow the ray until just after it.
+    float tStart = max(t - 2.5 * cell, 0.0);
+    float tEnd   = t + 2.5 * cell;
+    float tt     = tStart;
+    int   hitObject = -1;
+    for (int step = 0; step < 24; ++step) {
+        vec3  p    = from + dir * tt;
+        float best = 1e9;
+        int   which = -1;
+        for (int k = 0; k < 4; ++k) {
+            if (k >= nearCount) break;
+            float d = meshFieldDistance(near[k], p);
+            if (d < best) { best = d; which = near[k]; }
+        }
+        if (best < 0.05 * cell + 0.15 * roughness * tt) { hitObject = which; break; }
+        tt += max(0.8 * best, 0.02 * cell);
+        if (tt > tEnd) return false;   // went past: the field's hit was a ghost
+    }
+    if (hitObject < 0) return false;
+
+    // The normal: where the mesh's distance grows fastest, measured with a step
+    // of about the mesh's own cell.
+    vec3  p = from + dir * tt;
+    float e = max(0.75 * fieldInstances[hitObject].boxMax.w * fieldInstances[hitObject].extra.x, 1e-4);
+    vec3 gradient = vec3(
+        meshFieldDistance(hitObject, p + vec3(e, 0.0, 0.0)) - meshFieldDistance(hitObject, p - vec3(e, 0.0, 0.0)),
+        meshFieldDistance(hitObject, p + vec3(0.0, e, 0.0)) - meshFieldDistance(hitObject, p - vec3(0.0, e, 0.0)),
+        meshFieldDistance(hitObject, p + vec3(0.0, 0.0, e)) - meshFieldDistance(hitObject, p - vec3(0.0, 0.0, e)));
+    if (dot(gradient, gradient) < 1e-12) return false;
+    normal = normalize(gradient);
+    if (dot(normal, dir) > 0.0) normal = -normal;
+
+    surface = vec4(fieldInstances[hitObject].extra.yzw, fieldInstances[hitObject].boxMin.w);
+    t = tt;
+    return true;
+}
+
+/// What a shiny surface sees in direction `dir` from `origin`, found by tracing
+/// the distance field: the ray advances by the distance the field gives until
+/// it is close enough to a surface to count as hitting it. The hit is lit in a
+/// simple way (its object's base colour, the sky's light, and the sun with its
+/// own shadow from the field), which is all a reflection needs of it.
+/// A rough surface blurs what it sees, so the ray is allowed to hit from farther
+/// away, which softens the edges of what is reflected.
+/// @return rgb: the light that comes from there. a: 1 if something was hit, else 0.
+vec4 distanceFieldReflection(vec3 origin, vec3 normal, vec3 dir, float roughness) {
+    vec2 start = distanceFieldSample(origin);
+    if (start.y == 0.0) return vec4(0.0);   // outside the field
+
+    float cell = start.y;
+    vec3  from = origin + normal * (1.25 * cell);
+    float tMax = scene.sdfParams.z;
+
+    float t = 0.0;
+    bool  hit = false;
+    bool  refined = false;
+    vec3  n = vec3(0.0);
+    vec4  surface = vec4(0.0);
+    int steps = int(scene.sdfQuality.x);
+    for (int i = 0; i < SDF_REFLECTION_STEPS; ++i) {
+        if (i >= steps) return vec4(0.0);
+        vec3 p = from + dir * t;
+        vec2 s = distanceFieldSample(p);
+        if (s.y == 0.0) return vec4(0.0);   // left the field: the sky is what is there
+
+        if (s.x < 0.2 * s.y + 0.25 * roughness * t) {
+            // The field says something is here, but its cells are coarse and its
+            // surfaces inflated: two close objects merge, corners round off. The
+            // meshes decide. If none is really there, the ray goes on.
+            if (scene.sdfQuality.w < 0.5) { hit = true; break; }
+            if (refineHitWithMeshes(from, dir, roughness, s.y, t, n, surface)) { hit = true; refined = true; break; }
+            t += 1.5 * s.y;
+            if (t >= tMax) return vec4(0.0);
+            continue;
+        }
+        t += max(0.65 * s.x, 0.25 * s.y);
+        if (t >= tMax) return vec4(0.0);
+    }
+    if (!hit) return vec4(0.0);
+
+    vec3 p = from + dir * t;
+    vec2 here = distanceFieldSample(p);
+    float h = here.y;
+    if (!refined) {
+        float g = 0.75 * h;   // a little less than a cell, to follow smaller shapes
+
+        // The surface's direction: where the distance grows fastest.
+        vec3 gradient = vec3(
+            distanceFieldSample(p + vec3(g, 0.0, 0.0)).x - distanceFieldSample(p - vec3(g, 0.0, 0.0)).x,
+            distanceFieldSample(p + vec3(0.0, g, 0.0)).x - distanceFieldSample(p - vec3(0.0, g, 0.0)).x,
+            distanceFieldSample(p + vec3(0.0, 0.0, g)).x - distanceFieldSample(p - vec3(0.0, 0.0, g)).x);
+        n = (dot(gradient, gradient) > 1e-12) ? normalize(gradient) : -dir;
+        if (dot(n, dir) > 0.0) n = -n;   // it faces the ray
+
+        surface = distanceFieldColour(p);
+    }
+
+    vec3 albedo  = surface.rgb;
+    float metal  = surface.a;
+    vec3 light   = scene.ambientColor.rgb + scene.environmentParams.x * environmentDiffuse(n);
+
+    // The first directional light is the sun.
+    int count = min(scene.lightCount.x, MAX_LIGHTS);
+    for (int i = 0; i < count; ++i) {
+        Light sun = scene.lights[i];
+        if (sun.colorType.w != LIGHT_DIRECTIONAL) continue;
+
+        vec3  toSun = normalize(-sun.direction.xyz);
+        float nDotL = dot(n, toSun);
+        if (nDotL > 0.0) {
+            float shadow = (sun.extra.x > 0.5 && scene.sdfTuning.y > 0.5)
+                         ? distanceFieldShadow(p, n, toSun, sun.direction.w, 0.0, scene.sdfParams.z)
+                         : 1.0;
+            light += sun.colorType.rgb * nDotL * shadow;
+        }
+        break;
+    }
+    // A metal has no diffuse light: it shows the sky mirrored in it, tinted by
+    // its colour. What it would reflect of the scene itself is not followed.
+    vec3 mirrored = scene.ambientColor.rgb + scene.environmentParams.x * environmentSpecular(reflect(dir, n), 0.3);
+    vec3 colour   = mix(albedo * light, albedo * mirrored, metal);
+
+    // The field's cells grow with the distance from the camera, and so does its
+    // error (a surface is inflated by half a cell). The finest level is believed;
+    // the second one only if the setting says so (its cells are four times
+    // bigger); the coarsest never, and the sky shows there instead.
+    float finest  = scene.sdfQuality.y;
+    float believe = (scene.sdfQuality.z > 0.5) ? 6.0 : 2.5;
+    if (refined) believe *= 1.6;   // the meshes put the hit where it really is
+    float trust   = 1.0 - smoothstep(believe * finest * 0.6, believe * finest, max(cell, h));
+    return vec4(colour, trust);
+}
+
+/// Probe number `index` seen towards `direction`, at mip level `lod`.
+vec3 probeColour(int index, vec3 direction, float lod) {
+    switch (index) {
+        case 0:  return textureLod(probeCubes[0], direction, lod).rgb;
+        case 1:  return textureLod(probeCubes[1], direction, lod).rgb;
+        case 2:  return textureLod(probeCubes[2], direction, lod).rgb;
+        case 3:  return textureLod(probeCubes[3], direction, lod).rgb;
+        case 4:  return textureLod(probeCubes[4], direction, lod).rgb;
+        case 5:  return textureLod(probeCubes[5], direction, lod).rgb;
+        case 6:  return textureLod(probeCubes[6], direction, lod).rgb;
+        default: return textureLod(probeCubes[7], direction, lod).rgb;
+    }
+}
+
+/// What the reflection probes show in direction `dir` from `worldPos`, blurred
+/// for `roughness`. rgb: the light. a: how much the probes cover this point
+/// (0: outside every probe's box, 1: well inside one).
+///
+/// A probe applies inside its box and fades out over the width of its border;
+/// where boxes overlap their pictures are averaged by that weight. With box
+/// projection the direction is corrected for parallax: the probe's picture was
+/// taken from its own position, not from `worldPos`, so the ray is followed to
+/// the box (which stands for the walls of the room) and the picture is read
+/// towards that point instead.
+vec4 probeReflection(vec3 worldPos, vec3 dir, float roughness) {
+    vec3  sum         = vec3(0.0);
+    float totalWeight = 0.0;
+    float lod         = roughness * float(textureQueryLevels(probeCubes[0]) - 1);
+
+    for (int i = 0; i < scene.probeCount.x; ++i) {
+        vec3 boxMin = scene.probeBoxMin[i].xyz;
+        vec3 boxMax = scene.probeBoxMax[i].xyz;
+
+        // Distance to the nearest face of the box, from inside (negative outside).
+        vec3  inside = min(worldPos - boxMin, boxMax - worldPos);
+        float depth  = min(inside.x, min(inside.y, inside.z));
+        if (depth <= 0.0) continue;
+
+        float weight = clamp(depth / max(scene.probeBoxMax[i].w, 1e-3), 0.0, 1.0);
+
+        vec3 lookup = dir;
+        if (scene.probePosition[i].w > 0.5) {
+            // Where the ray leaves the box, and from the probe towards that point.
+            vec3 safeDir = vec3(abs(dir.x) < 1e-4 ? 1e-4 : dir.x,
+                                abs(dir.y) < 1e-4 ? 1e-4 : dir.y,
+                                abs(dir.z) < 1e-4 ? 1e-4 : dir.z);
+            vec3 toMax = (boxMax - worldPos) / safeDir;
+            vec3 toMin = (boxMin - worldPos) / safeDir;
+            vec3 far   = max(toMax, toMin);
+            float distance = min(far.x, min(far.y, far.z));
+            lookup = worldPos + dir * distance - scene.probePosition[i].xyz;
+        }
+
+        vec3 colour = probeColour(int(scene.probeLayer[i].x + 0.5), lookup, lod);
+        sum         += colour * scene.probeBoxMin[i].w * weight;
+        totalWeight += weight;
+    }
+
+    if (totalWeight <= 0.0) return vec4(0.0);
+    return vec4(sum / totalWeight, min(totalWeight, 1.0));
+}
+
 void main() {
     // The surface as geometry says (used for shadows) and as the normal map
     // says (used for shading).
@@ -687,8 +1162,19 @@ void main() {
         // skipped. The shadow uses the geometric normal: the normal map is
         // detail finer than the shadow map can show.
         int shadowSlot = int(light.spotCone.z);
-        if (shadowSlot >= 0 && nDotL > 0.0 && strength > 0.0) {
-            if (type == LIGHT_POINT)
+        if (nDotL > 0.0 && strength > 0.0) {
+            // The distance field takes over where it was asked to: for every
+            // light that casts (mode 2), or just for those with no shadow map (mode 1).
+            bool traced = light.extra.x > 0.5
+                       && (scene.sdfParams.x > 1.5 || (scene.sdfParams.x > 0.5 && shadowSlot < 0));
+            if (traced) {
+                float reach = (type == LIGHT_DIRECTIONAL) ? scene.sdfParams.z
+                                                          : max(light.positionRange.w, 1e-3);
+                strength *= distanceFieldShadow(fragWorldPos, geometricNormal, toLight,
+                                                light.direction.w, lightDistance, reach);
+            } else if (shadowSlot < 0) {
+                // No shadow map and no tracing: unshadowed.
+            } else if (type == LIGHT_POINT)
                 strength *= pointShadowFactor(shadowSlot, fragWorldPos, geometricNormal, toLight,
                                               lightDistance, light.positionRange.xyz,
                                               light.positionRange.w, light.direction.w);
@@ -736,6 +1222,34 @@ void main() {
     vec3 diffuseLight  = scene.ambientColor.rgb + skyStrength * environmentDiffuse(normal);
     vec3 specularLight = scene.ambientColor.rgb + skyStrength * environmentSpecular(reflected, roughness);
 
+    // Inside a reflection probe's box the surroundings it photographed replace
+    // the sky's reflection (they include the sky, where it is visible from there).
+    if (scene.probeCount.x > 0) {
+        vec4 probe = probeReflection(fragWorldPos, reflected, roughness);
+        specularLight = mix(specularLight, probe.rgb, probe.a);
+    }
+
+    // Shiny surfaces mirror what is on screen where the ray finds something,
+    // and the sky everywhere else.
+    vec4 ssr = vec4(0.0);
+    if (scene.ssrParams.x > 0.0 && roughness < 0.6) {
+        vec3 rayStart = fragWorldPos + geometricNormal * (0.01 + 0.004 * length(fragWorldPos - scene.cameraPosition.xyz) * scene.cameraPosition.w);
+        ssr = screenSpaceReflection(rayStart, reflected, roughness);
+    }
+
+    // What the screen does not show, the distance field can: it knows the whole
+    // scene near the camera, on screen or not. It goes under the screen's
+    // reflection, which is sharper and has the real colours, and is skipped
+    // where that one already found something.
+    if (scene.sdfParams.w > 0.5 && roughness < 0.6 && ssr.a < 0.99) {
+        vec4  field = distanceFieldReflection(fragWorldPos, geometricNormal, reflected, roughness);
+        float fade  = 1.0 - smoothstep(0.25, 0.6, roughness);
+        specularLight = mix(specularLight, field.rgb, field.a * fade);
+    }
+
+    if (ssr.a > 0.0)
+        specularLight = mix(specularLight, ssr.rgb, ssr.a * min(scene.ssrParams.x, 1.0));
+
     // Where nearby geometry blocks the sky, less of this light arrives. Direct
     // lights are not touched: they have their shadow maps for that.
     float occlusion = texture(ambientOcclusionMap, gl_FragCoord.xy / vec2(textureSize(ambientOcclusionMap, 0))).r;
@@ -752,5 +1266,11 @@ void main() {
     // translucent surface adds it to the background dimmed by (1 - alpha).
     // Highlights are added whole, so glass still glints. For anything solid
     // opacity is 1 and this is just the sum.
-    outColor = vec4(linearToSrgb(toneMapNeutral(radiance * opacity + radianceSpec)), coverage);
+    //
+    // The light leaves as it is: linear and possibly far brighter than 1. The
+    // post-processing step (PostProcess) applies bloom, exposure, tone mapping
+    // and the screen encoding to the whole picture afterwards. The cap only
+    // keeps a freak value (the sun's glint on a mirror) from overflowing the
+    // 16-bit float of the target into infinity.
+    outColor = vec4(min(radiance * opacity + radianceSpec, vec3(60000.0)), coverage);
 }

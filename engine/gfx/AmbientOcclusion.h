@@ -108,6 +108,11 @@ public:
     /// @return A set whose single texel is 1: no occlusion anywhere.
     VkDescriptorSet whiteSet() const { return m_whiteSet; }
 
+    /// @return The view of the prepass's depth (nearest-readable, layout
+    ///         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL after endDepth()).
+    ///         Changes whenever resize() makes new images. The reflections read it too.
+    VkImageView depthView() const { return m_depth.view; }
+
 private:
     struct Image {
         VkImage       image      = VK_NULL_HANDLE;

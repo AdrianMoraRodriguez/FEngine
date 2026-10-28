@@ -8,9 +8,15 @@
 #include "core/Geometry.h"
 #include "gfx/AmbientOcclusion.h"
 #include "gfx/Environment.h"
+#include "core/ProjectSettings.h"
+#include "gfx/GlobalDistanceField.h"
 #include "gfx/MeshLibrary.h"
 #include "gfx/MeshPipeline.h"
 #include "gfx/OutlinePass.h"
+#include "gfx/OffscreenBuffer.h"
+#include "gfx/PostProcess.h"
+#include "gfx/ReflectionProbes.h"
+#include "gfx/ScreenReflections.h"
 #include "gfx/SceneUniforms.h"
 #include "gfx/TextureLibrary.h"
 #include "gfx/ShadowCascades.h"
@@ -105,9 +111,15 @@ public:
      *
      * @param ctx       Initialised Vulkan context.
      * @param shaderDir Directory containing the compiled SPIR-V shaders.
+     * @param project   The project's quality settings (distance field detail,
+     *                  ray steps and so on). Not copied: the renderer reads it
+     *                  every frame, so the caller edits it in place and must keep
+     *                  it alive as long as the renderer. The resolution of the
+     *                  meshes' own fields is read here, once. With nullptr the
+     *                  defaults are used.
      * @return `true` on success.
      */
-    bool init(const VulkanContext& ctx, const char* shaderDir);
+    bool init(const VulkanContext& ctx, const char* shaderDir, const ProjectSettings* project = nullptr);
 
     /// Destroys all GPU resources. Safe to call more than once.
     void shutdown();
@@ -165,6 +177,25 @@ public:
                                 VkExtent2D extent);
 
     /**
+     * @brief Photographs the scene for the reflection probes that need it.
+     *
+     * A probe is photographed when it appears, when its Bake button is pressed,
+     * when it has been moved, and a moment after the scene changes (then once
+     * more a few seconds later, when textures that were still loading are in).
+     * At most one probe is done per frame. It also gives the shaders the list of
+     * probes that are ready, so it must run every frame.
+     *
+     * Call after renderShadows() (the photographs need the frame's lights and
+     * shadow maps) and before the scene pass, outside any render pass: it opens
+     * passes of its own.
+     *
+     * @param cmd        Command buffer from Renderer::currentCommandBuffer().
+     * @param scene      Scene to photograph.
+     * @param frameIndex Renderer::currentFrameIndex().
+     */
+    void renderProbes(VkCommandBuffer cmd, const Scene& scene, uint32_t frameIndex);
+
+    /**
      * @brief Records the draw calls for every renderable entity.
      *
      * Call renderShadows() first in the same frame: it provides the lights
@@ -190,7 +221,7 @@ public:
      * frame, outside any render pass, before the scene pass. The entity's
      * children are included, so selecting a parent outlines the whole group.
      * Does nothing if @p selected is null or has no mesh to draw, in which
-     * case drawSelectionOutline() draws nothing either.
+     * case renderPostProcess() draws no outline either.
      *
      * @param cmd      Command buffer from Renderer::currentCommandBuffer().
      * @param scene    Scene that holds the entity.
@@ -205,12 +236,19 @@ public:
                              VkExtent2D extent);
 
     /**
-     * @brief Draws the selection outline over the scene.
+     * @brief Makes the finished picture of the scene from its HDR image.
      *
-     * Call inside the scene pass, after render(). Draws nothing unless
-     * renderSelectionMask() found something to outline this frame.
+     * Adds the bloom, applies the scene's exposure and tone mapping (see
+     * SceneSettings) and writes @p target's 8-bit image(), then draws the
+     * selection outline over it (if renderSelectionMask() found something to
+     * outline this frame). Call right after Renderer::endOffscreenPass() of
+     * the scene pass, outside any render pass.
+     *
+     * @param cmd    Command buffer from Renderer::currentCommandBuffer().
+     * @param target The buffer the scene was drawn into.
+     * @param scene  Scene whose settings say what to do.
      */
-    void drawSelectionOutline(VkCommandBuffer cmd, VkExtent2D extent);
+    void renderPostProcess(VkCommandBuffer cmd, const OffscreenBuffer& target, const Scene& scene);
 
     /**
      * @brief Draws one mesh, framed and lit on its own, into a small target.
@@ -281,6 +319,16 @@ public:
     /// @return The mesh library, used to register models.
     MeshLibrary& meshes() { return m_meshes; }
 
+    /// @return The project settings in use (the defaults if none were given to init()).
+    const ProjectSettings& project() const;
+
+    /// When `true`, render() draws the global distance field (what the software
+    /// ray tracing sees) instead of the scene. A way to check the fields.
+    bool showDistanceField = false;
+
+    /// @return The distance field of the whole scene around the camera.
+    const GlobalDistanceField& globalDistanceField() const { return m_globalField; }
+
     /// The textures that materials use.
     TextureLibrary& textures() { return m_textures; }
 
@@ -346,13 +394,19 @@ private:
     /**
      * @brief Draws the solid parts of an object into the depth-only pass that is open.
      *
-     * Cut-out parts use the pipeline that reads their alpha; translucent
-     * parts are left out (they cast no shadow and do not occlude).
+     * Cut-out parts use the pipeline that reads their alpha. Translucent
+     * parts are drawn only when @p translucentCasts is set, and then with the
+     * same pipeline: shadow_mask.frag sees that the material is translucent and
+     * keeps a share of the pixels equal to its opacity, spread out by a noise
+     * pattern, so that the shadow map's filtering turns the holes into a
+     * lighter shadow. Ambient occlusion leaves them out: glass does not block
+     * the sky, and its depth would hide the objects behind it.
      *
      * @param mvp Transform from the object to the clip space of the pass.
+     * @param translucentCasts `true` for the shadow passes, `false` for the occlusion depth.
      */
     void drawDepthOnly(VkCommandBuffer cmd, AssetHandle handle, const MeshBuffer& mesh,
-                       const MaterialOverride& material, const glm::mat4& mvp);
+                       const MaterialOverride& material, const glm::mat4& mvp, bool translucentCasts);
 
     /// The material override of an entity (the default one if it has no material).
     static MaterialOverride overrideOf(const Scene& scene, entt::entity entity);
@@ -380,6 +434,32 @@ private:
     bool fitDirectionalShadow(const Scene& scene, const glm::vec3& lightDirection,
                               glm::mat4& outViewProj, float& outRadius) const;
 
+    /// The descriptor sets a pass of the scene reads besides each object's material.
+    struct SceneSets {
+        VkDescriptorSet uniforms;      ///< Set 0: lights and shadows.
+        VkDescriptorSet occlusion;     ///< Set 3.
+        VkDescriptorSet reflections;   ///< Set 4.
+        VkDescriptorSet probes;        ///< Set 5.
+        VkDescriptorSet distanceField; ///< Set 6.
+    };
+
+    /// Draws the solid objects, the sky and the translucent objects into the
+    /// offscreen pass that is currently open. The body of render(), shared
+    /// with the reflection probes' photographs.
+    void drawScene(VkCommandBuffer cmd, const Scene& scene, const glm::mat4& viewProj,
+                   VkExtent2D extent, const SceneSets& sets);
+
+    /// Photographs the scene from @p position into the cube map of probe slot @p slot.
+    /// Gathers the objects that have a distance field and rebuilds the global one if they or the camera changed.
+    void updateDistanceField(VkCommandBuffer cmd, const Scene& scene, uint32_t frameIndex,
+                             const glm::mat4& cameraView);
+
+    void bakeProbe(VkCommandBuffer cmd, const Scene& scene, uint32_t slot, const glm::vec3& position);
+
+    /// A number that changes when anything a probe's photograph shows changes
+    /// (objects, materials, lights, the sky). Not the probes themselves.
+    uint64_t hashScene(const Scene& scene) const;
+
     /// Draws every shadow caster into the map that is currently open.
     void drawShadowCasters(VkCommandBuffer cmd, const Scene& scene,
                            const glm::mat4& lightViewProj);
@@ -392,6 +472,7 @@ private:
     MeshPipeline   m_pipeline;
     MeshPipeline   m_translucentPipeline;   ///< The same shader, blended and without depth writes.
     OutlinePass    m_outline;
+    PostProcess    m_post;
     bool           m_outlineActive = false;   ///< A mask was drawn this frame.
     /// Set while a preview is drawn: materials then use a small copy of the
     /// albedo texture only (see resolvePart()).
@@ -403,8 +484,35 @@ private:
     const VulkanContext*  m_ctx = nullptr;
     VkDescriptorSetLayout m_environmentLayout = VK_NULL_HANDLE;   ///< Set 2 of the mesh pipeline.
     SkyPipeline           m_sky;
+    GlobalDistanceField   m_globalField;          ///< Every object's distance field, merged around the camera.
     AmbientOcclusion      m_occlusion;            ///< Set 3 of the mesh pipeline.
     bool                  m_occlusionValid = false;   ///< renderAmbientOcclusion() produced this frame's result.
+    ReflectionProbes      m_probes;               ///< Set 5 of the mesh pipeline.
+    OffscreenBuffer       m_probeTarget;          ///< Where a probe's faces are drawn, one at a time.
+    SceneUniformData      m_frameData;            ///< This frame's scene data, as renderShadows() made it.
+
+    /// What the renderer remembers about each probe slot.
+    struct ProbeSlot {
+        uint64_t  id             = 0;        ///< UUID of the entity that owns the slot (0 = free).
+        bool      baked          = false;    ///< The slot's cube map holds a photograph.
+        bool      dirty          = false;    ///< Must be photographed again.
+        glm::vec3 bakedPosition{0.0f};       ///< Where the photograph was taken.
+        glm::vec3 lastPosition{0.0f};        ///< Where the probe was last frame.
+        uint32_t  bakedSerial    = 0;        ///< ReflectionProbeComponent::bakeSerial at that time.
+        uint32_t  stillFrames    = 0;        ///< Frames the probe has stayed where it is.
+    };
+    std::array<ProbeSlot, kMaxReflectionProbes> m_probeSlots;
+    const ProjectSettings* m_project = nullptr;   ///< The project's settings (see init()); null: defaults.
+    uint64_t m_probeSceneHash    = 0;       ///< hashScene() of the last frame.
+    uint32_t m_probeSceneStill   = 0;       ///< Frames the scene has stayed as it is.
+    bool     m_probeStale        = false;   ///< The scene changed: photograph every probe once it settles.
+    bool     m_probeStaleFollow  = false;   ///< The stale mark comes from the follow-up, which does not schedule another.
+    uint32_t m_probeFollowUp     = 0;       ///< Frames left until the follow-up photographs (0 = none planned).
+
+    ScreenReflections     m_reflections;          ///< Set 4 of the mesh pipeline.
+    bool                  m_reflectionsDepth = false;   ///< This frame's depth prepass ran and m_reflections points at it.
+    glm::mat4             m_viewProj{1.0f};       ///< Camera matrix of the frame being recorded.
+    glm::mat4             m_historyViewProj{1.0f};   ///< Camera matrix of the picture m_reflections holds.
     Environment           m_defaultEnvironment;   ///< The built-in sky: used when the scene has none, and by previews.
     Environment           m_sceneEnvironment;     ///< The picture the scene asked for, once baked.
 

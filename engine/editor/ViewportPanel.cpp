@@ -597,6 +597,46 @@ void ViewportPanel::drawLightGizmos(float x, float y, float width, float height)
         }
     }
 
+    // Reflection probes: a little sphere at the probe, and for the selected one
+    // the box where it applies (the edges are lines in world space).
+    auto probes = m_scene.registry().view<const ReflectionProbeComponent, const WorldTransform>();
+    for (auto [entity, probe, world] : probes.each()) {
+        const bool      selected = (entity == m_selected);
+        const glm::vec3 centre   = glm::vec3(world.matrix[3]);
+
+        glm::mat4 model(1.0f);
+        model[3] = world.matrix[3];
+        const ImU32 colour = selected ? IM_COL32(255, 170, 40, 255) : IM_COL32(120, 200, 230, 255);
+        const GizmoPen pen{draw, viewProj, model, x, y, width, height, colour, selected ? 2.0f : 1.5f};
+
+        // A ball: three crossed circles, with a smaller one inside it, like a mirror ball.
+        pen.circle(origin, axisX, axisY, r);
+        pen.circle(origin, axisX, axisZ, r);
+        pen.circle(origin, axisY, axisZ, r);
+
+        if (!selected) continue;
+
+        const GizmoPen boxPen{draw, viewProj, glm::mat4(1.0f), x, y, width, height,
+                              IM_COL32(255, 170, 40, 140), 1.0f};
+        const glm::vec3 half = 0.5f * glm::max(probe.boxSize, glm::vec3(0.5f));
+        const glm::vec3 lo = centre - half, hi = centre + half;
+        const glm::vec3 corner[8] = {
+            {lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {lo.x, hi.y, lo.z},
+            {lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z}};
+        for (int i = 0; i < 4; ++i) {
+            boxPen.line(corner[i], corner[(i + 1) % 4]);           // the face at low z
+            boxPen.line(corner[4 + i], corner[4 + (i + 1) % 4]);   // the face at high z
+            boxPen.line(corner[i], corner[4 + i]);                 // the edges between them
+        }
+
+        const glm::vec4 clip = viewProj * world.matrix[3];
+        if (clip.w > 0.01f) {
+            const ImVec2 screen(x + (clip.x / clip.w * 0.5f + 0.5f) * width + 12.0f,
+                                y + (1.0f - (clip.y / clip.w * 0.5f + 0.5f)) * height - 22.0f);
+            draw->AddText(screen, IM_COL32(255, 170, 40, 255), "Reflection probe");
+        }
+    }
+
     draw->PopClipRect();
 }
 
